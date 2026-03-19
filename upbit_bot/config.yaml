@@ -1,0 +1,156 @@
+# config.yaml — 업비트 퀀트 봇 설정
+# 민감 정보(.env)는 이 파일에 기록하지 않음.
+# 변경 시 봇 재시작 필요 (핫리로드 미지원).
+
+# ─────────────────────────────────────────────────────────────────
+# 일반
+# ─────────────────────────────────────────────────────────────────
+general:
+  phase: "A"                    # 현재 진행 Phase (A/B/C/D)
+  log_level: "INFO"             # DEBUG / INFO / WARNING / ERROR
+  log_dir: "logs"               # 로그 디렉터리 (봇 루트 기준)
+  db_path: "bot.db"             # SQLite DB 파일명 (봇 루트 기준)
+  timezone: "Asia/Seoul"        # 대시보드·리포트 표시용 로컬 타임존
+
+# ─────────────────────────────────────────────────────────────────
+# 트레이딩
+# ─────────────────────────────────────────────────────────────────
+trading:
+  dry_run: true                 # true=DRY_RUN 강제 (trade_count<200 자동 활성화)
+  initial_capital: 1000000      # 초기 자본 KRW (백테스트·드라이런 기준)
+  max_positions: 5              # 동시 최대 포지션 수
+  max_daily_trades: 10          # 일일 최대 거래 횟수
+  min_position_krw: 50000       # 최소 단일 투자금 KRW
+  max_single_pct: 0.30          # 단일 포지션 최대 자본 비율 (30%)
+  entry_delay_max_sec: 90       # 진입 랜덤 지연 최대 초 (front-running 방어)
+
+# ─────────────────────────────────────────────────────────────────
+# 페어리스트
+# ─────────────────────────────────────────────────────────────────
+pairlist:
+  max_coins: 10                 # 동시 모니터링 최대 코인 수
+  volume_rank_min: 1            # 거래량 순위 하한
+  volume_rank_max: 30           # 거래량 순위 상한
+  refresh_interval_hours: 24    # 페어리스트 갱신 주기 (시간)
+  blacklist:                    # 레버리지·스테이블 등 제외 목록
+    - "KRW-USDT"
+    - "KRW-DAI"
+
+# ─────────────────────────────────────────────────────────────────
+# Layer 1 필터 임계값
+# ─────────────────────────────────────────────────────────────────
+layer1:
+  adx_min: 15.0                 # ADX 최소값 (미만 → 매수 보류)
+  adx_normal: 20.0              # ADX 보통 추세
+  adx_strong: 30.0              # ADX 강한 추세
+  fear_greed_min: 15            # Fear&Greed 하한
+  fear_greed_max: 85            # Fear&Greed 상한
+  btc_dom_threshold: 60.0       # BTC 도미넌스 경계 (%)
+  volume_ratio_min: 0.5         # 거래량 비율 최소 (20기간 평균 대비)
+  latency_max_ms: 500           # API 레이턴시 최대 (ms)
+  kimchi_premium_high: 5.0      # 김치프리미엄 과열 경계 (%)
+  kimchi_premium_low: -2.0      # 역프리미엄 경계 (%)
+
+# ─────────────────────────────────────────────────────────────────
+# Layer 2 앙상블
+# ─────────────────────────────────────────────────────────────────
+layer2:
+  threshold: 0.62               # 초기 앙상블 임계값 (Optuna 탐색: 0.55~0.75)
+  consensus_min: 3              # 최소 합의 모델 수 (4개 중 3개 이상)
+  retrain_accuracy_min: 0.55    # 2주 정확도 이 미만이면 재학습 트리거
+  model_weights:                # 각 모델 가중치 (합=1.0)
+    xgb:  0.30
+    lgb:  0.30
+    lstm: 0.25
+    gru:  0.15
+  batch_size: 32                # PyTorch 배치 크기 (CPU 강제, M4 제한)
+  max_candles_memory: 500       # 코인당 인메모리 캔들 최대 수
+
+# ─────────────────────────────────────────────────────────────────
+# Kelly + VaR
+# ─────────────────────────────────────────────────────────────────
+kelly:
+  fraction: 0.25                # 풀 Kelly의 1/4 (보수적)
+  max_single_pct: 0.30          # 단일 포지션 상한 (30%)
+  consecutive_penalty: 0.10     # 연속 손실 1회당 추가 감소 비율
+  var_confidence: 0.95          # 역사적 VaR 신뢰 수준
+
+# ─────────────────────────────────────────────────────────────────
+# 트레일링 스탑
+# ─────────────────────────────────────────────────────────────────
+trailing_stop:
+  multiplier_strong: 3.0        # TREND_STRONG ATR 배수
+  multiplier_normal: 2.5        # TREND_NORMAL ATR 배수
+  multiplier_grid:   2.0        # GRID/DCA ATR 배수
+  partial_exit_pct:  0.05       # 부분 익절 목표 (+5%)
+  partial_exit_ratio: 0.50      # 부분 익절 비율 (50%)
+
+# ─────────────────────────────────────────────────────────────────
+# 서킷브레이커
+# ─────────────────────────────────────────────────────────────────
+circuit_breaker:
+  level1_daily_loss_pct: -0.02  # 당일 -2% → Level 1 (신규 매수 정지)
+  level2_daily_loss_pct: -0.05  # 당일 -5% → Level 2 (전체 중단 1시간)
+  level3_daily_loss_pct: -0.10  # 당일 -10% → Level 3 (전체 중단 4시간)
+  level4_drawdown_pct:  -0.20   # 최대 낙폭 -20% → Level 4 (전체 중단 24시간)
+  level5_consecutive:    5      # 연속 손실 5회 → Level 5 (수동 해제)
+  api_error_threshold:   5      # 5분 내 API 오류 5회 → 임시 중단
+
+# ─────────────────────────────────────────────────────────────────
+# 전략
+# ─────────────────────────────────────────────────────────────────
+strategy:
+  grid:
+    levels: 10                  # 그리드 레벨 수
+    range_pct: 0.10             # 그리드 범위 (±5%, 총 10%)
+    unit_krw: 100000            # 레벨당 주문 금액 KRW
+    recalc_interval_hours: 4    # 범위 재계산 주기
+
+  dca:
+    base_amount_krw: 200000     # 기본 주문 금액 KRW
+    safety_orders: 5            # 최대 Safety Order 수
+    step_pct: 0.03              # Safety Order 간격 (3%)
+    volume_scale: 1.5           # Safety Order 금액 배율
+    monitor_interval_min: 5     # DCA 모니터링 주기 (분)
+
+  decay:
+    min_sharpe: 0.5             # 4주 롤링 샤프 최소값 (미만 → DORMANT)
+    min_win_rate: 0.40          # 최소 승률 (미만 → 경고)
+    dormant_weeks: 4            # DORMANT 유지 기간 (주)
+
+# ─────────────────────────────────────────────────────────────────
+# 스케줄러 (APScheduler CronTrigger)
+# ─────────────────────────────────────────────────────────────────
+scheduler:
+  coin_history_snapshot: "0 0 * * *"       # 매일 00:00 UTC
+  data_quality_report:   "0 1 * * *"       # 매일 01:00 UTC
+  daily_report:          "0 14 * * *"      # 매일 23:00 KST (= 14:00 UTC)
+  decay_weekly:          "0 5 * * 0"       # 매주 일요일 05:00 UTC
+  pairlist_refresh:      "0 19 * * *"      # 매일 04:00 KST (= 19:00 UTC 전날)
+  grid_recalc:           "0 */4 * * *"     # 매 4시간
+
+# ─────────────────────────────────────────────────────────────────
+# 데이터 수집
+# ─────────────────────────────────────────────────────────────────
+data:
+  websocket_reconnect_delay_sec: 5    # WebSocket 재연결 대기
+  candle_history_days: 90             # REST 초기 로딩 기간 (일)
+  quality_check_interval_min: 60      # DataQualityChecker 실행 주기 (분)
+
+# ─────────────────────────────────────────────────────────────────
+# StorageManager
+# ─────────────────────────────────────────────────────────────────
+storage:
+  db_warn_mb: 10240             # DB 크기 경고 임계 (10 GB)
+  disk_warn_gb: 50              # 잔여 디스크 경고 임계 (GB)
+  disk_critical_gb: 20          # 잔여 디스크 긴급 임계 (GB)
+  vacuum_pause_sec: 30          # VACUUM 실행 전 트레이딩 루프 일시 정지 시간
+
+# ─────────────────────────────────────────────────────────────────
+# 백테스트 / Walk-Forward
+# ─────────────────────────────────────────────────────────────────
+backtest:
+  walk_forward_folds: 5         # Walk-Forward 폴드 수
+  train_ratio: 0.70             # 학습 비율
+  mc_simulations: 1000          # Monte Carlo 시뮬레이션 횟수
+  min_sharpe_wf: 0.5            # Walk-Forward 최소 샤프 (미만 → 배포 보류)

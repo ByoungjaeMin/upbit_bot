@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source venv/bin/activate)",
+      "Bash(pip install:*)",
+      "Bash(source ../venv/bin/activate)",
+      "Bash(python -m pytest data/test_cache.py data/test_quality.py data/test_candle_builder.py -v)",
+      "Bash(python -m pytest layers/test_layer1_filter.py risk/ -v)",
+      "Bash(find /Users/byoungjaemin/quant -name *.md)",
+      "Bash(python -m pytest layers/test_layer2_ensemble.py -v)",
+      "Bash(python -c \"import xgboost; print\\(xgboost.__version__\\)\")",
+      "Bash(python -c \"import lightgbm; print\\(lightgbm.__version__\\)\")",
+      "Bash(python -c \"import xgboost, lightgbm; print\\(xgboost.__version__, lightgbm.__version__\\)\")",
+      "Bash(brew install:*)",
+      "Bash(python -c \"import optuna, torch; print\\(''optuna'', optuna.__version__, ''torch'', torch.__version__\\)\")",
+      "Bash(python -m pytest layers/ risk/ data/ test_schema.py -v --tb=short)",
+      "Bash(python -m pytest strategies/ layers/test_layer3_rl.py -v)",
+      "Bash(python -m pytest layers/ risk/ data/ strategies/ -v --tb=short)",
+      "Bash(python -m pytest execution/ -v --tb=short)",
+      "Bash(python -m pytest layers/ risk/ data/ strategies/ execution/ -v --tb=short)",
+      "Bash(python -m pytest backtest/ -v --tb=short)",
+      "Bash(python -m pytest layers/ risk/ data/ strategies/ execution/ backtest/ --tb=short -q)",
+      "Bash(python:*)",
+      "Bash(pip list:*)",
+      "Bash(pip index:*)",
+      "Bash(DRY_RUN=true timeout 15 python upbit_bot/main.py)",
+      "Bash(echo \"EXIT_CODE=$?\")",
+      "Bash(DRY_RUN=true gtimeout 15 python upbit_bot/main.py)",
+      "Bash(pip show:*)",
+      "Bash(wait)"
+    ]
+  }
+}

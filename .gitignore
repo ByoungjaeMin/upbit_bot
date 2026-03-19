@@ -1,0 +1,41 @@
+# 환경 변수 / API 키 (절대 커밋 금지)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 가상환경
+.venv/
+venv/
+env/
+
+# 모델 체크포인트 (용량 큼)
+models/*.pt
+models/*.pth
+models/*.ckpt
+
+# SQLite DB
+*.db
+*.sqlite3
+
+# 로그
+*.log
+logs/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
