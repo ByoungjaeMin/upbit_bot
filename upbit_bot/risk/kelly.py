@@ -65,10 +65,14 @@ class KellySizer:
         total_capital: float,
         kelly_fraction: float = KELLY_FRACTION,
         max_single_pct: float = MAX_SINGLE_PCT,
+        atr_high_threshold: float = ATR_HIGH_THRESHOLD,
+        atr_low_threshold: float = ATR_LOW_THRESHOLD,
     ) -> None:
-        self._capital       = total_capital
-        self._kelly_frac    = kelly_fraction
-        self._max_single    = max_single_pct
+        self._capital           = total_capital
+        self._kelly_frac        = kelly_fraction
+        self._max_single        = max_single_pct
+        self._atr_high          = atr_high_threshold
+        self._atr_low           = atr_low_threshold
 
     def update_capital(self, new_capital: float) -> None:
         """자본 동적 업데이트 (매 사이클 호출)."""
@@ -122,8 +126,8 @@ class KellySizer:
         if 0 < final_size < MIN_POSITION_KRW:
             final_size = 0.0  # 최소금액 미달 → 포지션 없음
 
-        # ATR 변동성 그룹
-        coin_group = _atr_group(atr_price_ratio)
+        # ATR 변동성 그룹 (인스턴스 임계값 사용)
+        coin_group = _atr_group(atr_price_ratio, self._atr_high, self._atr_low)
 
         logger.debug(
             "[KellySizer] %s raw=%.4f frac=%.4f hmm=%.4f var=%.4f final=%.4f"
@@ -211,9 +215,13 @@ class KellySizer:
 # ATR 변동성 그룹
 # ------------------------------------------------------------------
 
-def _atr_group(atr_price_ratio: float) -> str:
-    if atr_price_ratio > ATR_HIGH_THRESHOLD:
+def _atr_group(
+    atr_price_ratio: float,
+    high_threshold: float = ATR_HIGH_THRESHOLD,
+    low_threshold: float = ATR_LOW_THRESHOLD,
+) -> str:
+    if atr_price_ratio > high_threshold:
         return "HIGH"
-    if atr_price_ratio < ATR_LOW_THRESHOLD:
+    if atr_price_ratio < low_threshold:
         return "LOW"
     return "NORMAL"

@@ -27,7 +27,9 @@
       "Bash(echo \"EXIT_CODE=$?\")",
       "Bash(DRY_RUN=true gtimeout 15 python upbit_bot/main.py)",
       "Bash(pip show:*)",
-      "Bash(wait)"
+      "Bash(wait)",
+      "Bash(grep -E \":\\\\s*\\(pass|continue\\)\\\\s*$\")",
+      "Bash(git stash:*)"
     ]
   }
 }

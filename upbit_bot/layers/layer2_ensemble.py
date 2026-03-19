@@ -530,13 +530,13 @@ class Layer2Ensemble:
             try:
                 result["xgb"] = float(xgb.predict_proba(X2)[0, 1])
             except Exception as exc:
-                logger.warning("[Layer2] XGB 예측 오류: %s", exc)
+                logger.error("[Layer2] XGB 예측 오류 — 해당 모델 제외: %s", exc)
 
         if lgb is not None:
             try:
                 result["lgb"] = float(lgb.predict_proba(X2)[0, 1])
             except Exception as exc:
-                logger.warning("[Layer2] LGB 예측 오류: %s", exc)
+                logger.error("[Layer2] LGB 예측 오류 — 해당 모델 제외: %s", exc)
 
         return result
 

@@ -3,9 +3,9 @@ test_schema.py — schema.py 단위 테스트
 
 테스트 항목:
   - 8개 dataclass 기본 생성 + 타입
-  - 15개 테이블 DDL 파싱 가능 여부 (SQLite in-memory)
-  - 15개 인덱스 DDL 실행 성공
-  - RETENTION_DAYS 키 완전성 (15개 테이블 전부 존재)
+  - 16개 테이블 DDL 파싱 가능 여부 (SQLite in-memory)
+  - 16개 인덱스 DDL 실행 성공
+  - RETENTION_DAYS 키 완전성 (16개 테이블 전부 존재)
   - IMMUTABLE_TABLES 포함 여부
 """
 
@@ -37,6 +37,7 @@ EXPECTED_TABLES = {
     "ensemble_predictions", "trades", "layer1_log",
     "coin_scan_results", "strategy_log", "storage_audit_log",
     "kimchi_premium_log", "strategy_decay_log", "coin_history",
+    "paper_comparison",  # schema.py 16번 테이블 (v4 신규)
 }
 
 
@@ -150,7 +151,7 @@ def db():
 
 
 class TestSQLiteDDL:
-    def test_all_15_tables_defined(self):
+    def test_all_16_tables_defined(self):
         assert TABLE_DDLS.keys() == EXPECTED_TABLES, (
             f"누락 또는 초과 테이블: {TABLE_DDLS.keys() ^ EXPECTED_TABLES}"
         )
@@ -178,7 +179,7 @@ class TestSQLiteDDL:
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         )
         count = cur.fetchone()[0]
-        assert count == 15, f"테이블 수 불일치: {count}"
+        assert count == 16, f"테이블 수 불일치: {count}"
 
     def test_trades_unique_constraint(self, db):
         """trades 테이블에는 UNIQUE 제약이 없어야 함 — 동일 코인 다중 거래 허용."""

@@ -24,6 +24,7 @@ import asyncio
 import logging
 import random
 import uuid
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -135,9 +136,30 @@ class TradingEngine:
         upbit_client: UpbitClient | None = None,
         dry_run: bool = True,
         initial_capital: float = 10_000_000.0,
+        yaml_config: dict | None = None,
     ) -> None:
         self._dry_run = dry_run
         self._capital = initial_capital
+
+        # config.yaml 값으로 모듈 상수 오버라이드 (없으면 기본값 유지)
+        _t = (yaml_config or {}).get("trading", {})
+        self._max_positions       = int(_t.get("max_positions",       MAX_POSITIONS))
+        self._min_hold_minutes    = float(_t.get("min_hold_minutes",  MIN_HOLD_MINUTES))
+        self._reentry_cooldown    = float(_t.get("reentry_cooldown_min", REENTRY_COOLDOWN_MIN))
+        self._max_daily_trades    = int(_t.get("max_daily_trades",    MAX_DAILY_TRADES))
+        self._ensemble_threshold  = float(_t.get("ensemble_threshold", ENSEMBLE_THRESHOLD) if "ensemble_threshold" in _t else (yaml_config or {}).get("layer2", {}).get("threshold", ENSEMBLE_THRESHOLD))
+        self._consensus_min       = int(_t.get("consensus_min", CONSENSUS_MIN) if "consensus_min" in _t else (yaml_config or {}).get("layer2", {}).get("consensus_min", CONSENSUS_MIN))
+        self._var_max_pct         = float(_t.get("var_max_pct",       VAR_MAX_PCT))
+        self._tick_imbalance_min  = float(_t.get("tick_imbalance_min", TICK_IMBALANCE_MIN))
+        self._obi_min             = float(_t.get("obi_min",           OBI_MIN))
+        self._reentry_tick_min    = float(_t.get("reentry_tick_min",  REENTRY_TICK_MIN))
+        self._reentry_rsi_min     = float(_t.get("reentry_rsi_min",   REENTRY_RSI_MIN))
+        self._reentry_rsi_max     = float(_t.get("reentry_rsi_max",   REENTRY_RSI_MAX))
+        self._reentry_obi_min     = float(_t.get("reentry_obi_min",   REENTRY_OBI_MIN))
+        self._hard_stop_loss_pct  = float(_t.get("hard_stop_loss_pct", HARD_STOP_LOSS_PCT))
+        self._partial_tp1_pct     = float(_t.get("partial_tp1_pct",   PARTIAL_TP_1_PCT))
+        self._partial_tp2_pct     = float(_t.get("partial_tp2_pct",   PARTIAL_TP_2_PCT))
+        self._entry_delay_max_sec = float(_t.get("entry_delay_max_sec", ENTRY_DELAY_MAX_SEC))
 
         # 서킷브레이커 (최우선)
         self._cb = CircuitBreaker()
@@ -160,6 +182,9 @@ class TradingEngine:
 
         # 이벤트 큐 (텔레그램 비동기 전송용)
         self._telegram_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        # 가격 이력 (서킷브레이커 가격 급락 감지용, 코인당 최대 12개 = 1시간)
+        self._price_history: dict[str, deque[tuple[datetime, float]]] = {}
 
         # Layer 1, 2 컴포넌트 (외부 주입 or 내부 생성)
         self._layer1: Any = None
@@ -206,6 +231,12 @@ class TradingEngine:
             logger.warning("[Engine] 서킷브레이커 Level %d — 전체 차단", self._cb.level)
             return decisions
 
+        # Step 1.5: 가격 급락 서킷브레이커 체크 + Level 1 매수 차단 확인
+        self._check_price_circuits(market_states)
+        if self._cb.is_buy_blocked():
+            logger.warning("[Engine] 서킷브레이커 Level %d — 매수 차단 (포지션 모니터링은 유지)", self._cb.level)
+            return decisions
+
         # Step 2: DRY_RUN 강제 체크
         self._enforce_dry_run()
 
@@ -232,11 +263,11 @@ class TradingEngine:
 
         # Step 14: 전략별 주문 실행
         for ms, fr, ep, rb in candidates:
-            if len(self._positions) >= MAX_POSITIONS:
-                logger.info("[Engine] 최대 포지션 %d 초과 — %s 스킵", MAX_POSITIONS, ms.coin)
+            if len(self._positions) >= self._max_positions:
+                logger.info("[Engine] 최대 포지션 %d 초과 — %s 스킵", self._max_positions, ms.coin)
                 break
-            if self._state.daily_trade_count >= MAX_DAILY_TRADES:
-                logger.info("[Engine] 일 거래 상한 %d 도달", MAX_DAILY_TRADES)
+            if self._state.daily_trade_count >= self._max_daily_trades:
+                logger.info("[Engine] 일 거래 상한 %d 도달", self._max_daily_trades)
                 break
 
             decision = await self._execute_entry(ms, fr, ep, rb)
@@ -270,8 +301,8 @@ class TradingEngine:
             if ms:
                 self._update_trailing_stop(pos, ms)
 
-            # 하드 손절 (-7%)
-            if pos.pnl_pct(current) <= HARD_STOP_LOSS_PCT:
+            # 하드 손절
+            if pos.pnl_pct(current) <= self._hard_stop_loss_pct:
                 await self._close_position(coin, current, reason="hard_stop", emergency=True)
                 continue
 
@@ -358,11 +389,11 @@ class TradingEngine:
             # ① Layer 1 통과 (fr.tradeable)
 
             # ② 앙상블 조건
-            if ep.weighted_avg < ENSEMBLE_THRESHOLD:
-                logger.debug("[Engine] %s 앙상블 %.3f < %.2f", coin, ep.weighted_avg, ENSEMBLE_THRESHOLD)
+            if ep.weighted_avg < self._ensemble_threshold:
+                logger.debug("[Engine] %s 앙상블 %.3f < %.2f", coin, ep.weighted_avg, self._ensemble_threshold)
                 continue
-            if ep.consensus_count < CONSENSUS_MIN:
-                logger.debug("[Engine] %s consensus %d < %d", coin, ep.consensus_count, CONSENSUS_MIN)
+            if ep.consensus_count < self._consensus_min:
+                logger.debug("[Engine] %s consensus %d < %d", coin, ep.consensus_count, self._consensus_min)
                 continue
 
             # ③ Kelly > 0
@@ -370,22 +401,22 @@ class TradingEngine:
                 logger.debug("[Engine] %s Kelly ≤ 0 스킵", coin)
                 continue
 
-            # ④ VaR ≤ 자본 3%
-            if rb.var_95 > VAR_MAX_PCT:
+            # ④ VaR ≤ 자본 N%
+            if rb.var_95 > self._var_max_pct:
                 # 포지션 50% 축소 후 재판단
                 rb.var_adjusted_f *= 0.5
                 rb.final_position_size *= 0.5
-                logger.info("[Engine] %s VaR %.3f > 3%% — 포지션 50%% 축소", coin, rb.var_95)
+                logger.info("[Engine] %s VaR %.3f > %.0f%% — 포지션 50%% 축소", coin, rb.var_95, self._var_max_pct * 100)
                 if rb.var_adjusted_f <= 0:
                     continue
 
             # ⑤ 마이크로스트럭처 최소 확인
-            if ms.tick_imbalance < TICK_IMBALANCE_MIN and ms.obi < OBI_MIN:
+            if ms.tick_imbalance < self._tick_imbalance_min and ms.obi < self._obi_min:
                 logger.debug("[Engine] %s 마이크로스트럭처 부족", coin)
                 continue
 
-            # ⑥ 동시 보유 포지션 < 5
-            if len(self._positions) >= MAX_POSITIONS:
+            # ⑥ 동시 보유 포지션 < max
+            if len(self._positions) >= self._max_positions:
                 break
 
             # 재진입 쿨타임 확인
@@ -414,9 +445,9 @@ class TradingEngine:
         ③ OBI > 0.10 (오더북 매수 우위 최소 확인)
         """
         conds = [
-            ms.tick_imbalance > REENTRY_TICK_MIN,
-            REENTRY_RSI_MIN <= ms.rsi_5m <= REENTRY_RSI_MAX,
-            ms.obi > REENTRY_OBI_MIN,
+            ms.tick_imbalance > self._reentry_tick_min,
+            self._reentry_rsi_min <= ms.rsi_5m <= self._reentry_rsi_max,
+            ms.obi > self._reentry_obi_min,
         ]
         met = sum(conds)
         logger.debug("[Engine] 재진입 조건 %d/3", met)
@@ -434,6 +465,11 @@ class TradingEngine:
         rb: RiskBudget,
     ) -> TradeDecision | None:
         """전략별 진입 주문 실행."""
+        if fr is None:
+            # fr이 None이면 Layer1 결과 미존재 → HOLD
+            return None
+        # fr은 dict(캐시 직렬화 경로) 또는 FilterResult dataclass(정상 경로) 양쪽 모두 허용.
+        # "HOLD" 폴백: regime_strategy 필드가 없는 경우 진입하지 않는 것이 안전함.
         strategy = fr.get("regime_strategy", "HOLD") if isinstance(fr, dict) else getattr(fr, "regime_strategy", "HOLD")
         if strategy == "HOLD":
             return None
@@ -444,7 +480,7 @@ class TradingEngine:
         # TREND: 0~90초 랜덤 지연 (front-running 방어)
         delay_sec = 0.0
         if strategy.startswith("TREND"):
-            delay_sec = random.uniform(0, ENTRY_DELAY_MAX_SEC)
+            delay_sec = random.uniform(0, self._entry_delay_max_sec)
             if not is_dry:
                 logger.info("[Engine] 진입 지연 %.1f초 (front-running 방어)", delay_sec)
                 await asyncio.sleep(delay_sec)
@@ -475,7 +511,7 @@ class TradingEngine:
         try:
             status = await self._router.execute(
                 req,
-                trade_velocity=ms.trade_velocity,
+                trade_velocity=ms.trade_velocity if ms.trade_velocity is not None else 1.0,
             )
         except Exception as exc:
             logger.error("[Engine] 주문 실패 %s: %s", ms.coin, exc)
@@ -549,14 +585,24 @@ class TradingEngine:
             is_emergency=emergency,
         )
 
-        if emergency:
-            # 강제 손절: SmartOrderRouter 우회 여부는 is_emergency 플래그로 처리
-            # Level 2 이상 → split=False (전량 즉시)
-            split = self._cb.level < 2
-            status = await self._router.execute(req, split_emergency=split)
-        else:
-            # 일반 청산: 지정가 먼저, 10초 미체결 시 시장가
-            status = await self._normal_close(req)
+        try:
+            if emergency:
+                # 강제 손절: SmartOrderRouter 우회 여부는 is_emergency 플래그로 처리
+                # Level 2 이상 → split=False (전량 즉시)
+                split = self._cb.level < 2
+                status = await self._router.execute(req, split_emergency=split)
+            else:
+                # 일반 청산: 지정가 먼저, 10초 미체결 시 시장가
+                status = await self._normal_close(req)
+        except Exception as exc:
+            # 청산 실패 시 서킷브레이커에 기록하고 포지션은 유지 (강제 삭제 금지)
+            # position_loop가 다음 사이클에 재시도한다
+            logger.error(
+                "[Engine] 청산 실패 %s reason=%s: %s — 포지션 유지, 다음 사이클 재시도",
+                coin, reason, exc,
+            )
+            self._cb.record_api_error()
+            return False
 
         # 포지션 제거
         if partial_ratio is None or (partial_ratio and qty >= pos.qty):
@@ -595,6 +641,9 @@ class TradingEngine:
             if info.get("state") == "done":
                 return info
         except Exception:
+            # 의도적 폴백: get_order 실패 시 미체결로 간주하고 시장가 전환.
+            # 실제 체결됐더라도 cancel_with_race_guard → HTTP 400 "already done" →
+            # PartialFillHandler가 FULLY_FILLED 처리하므로 이중 청산 없음.
             pass
 
         # 미체결 → 시장가 전환
@@ -624,15 +673,15 @@ class TradingEngine:
         """부분 익절 조건 체크 (+10%, +20%)."""
         pnl = pos.pnl_pct(current_price)
 
-        if pnl >= PARTIAL_TP_2_PCT and not pos.partial_exit_done.get("20pct"):
+        if pnl >= self._partial_tp2_pct and not pos.partial_exit_done.get("20pct"):
             pos.partial_exit_done["20pct"] = True
             await self._close_position(pos.coin, current_price, reason="partial_tp_20", partial_ratio=0.5)
-            logger.info("[Engine] %s +20%% 부분 익절 50%%", pos.coin)
+            logger.info("[Engine] %s +%.0f%% 부분 익절 50%%", pos.coin, self._partial_tp2_pct * 100)
 
-        elif pnl >= PARTIAL_TP_1_PCT and not pos.partial_exit_done.get("10pct"):
+        elif pnl >= self._partial_tp1_pct and not pos.partial_exit_done.get("10pct"):
             pos.partial_exit_done["10pct"] = True
             await self._close_position(pos.coin, current_price, reason="partial_tp_10", partial_ratio=0.3)
-            logger.info("[Engine] %s +10%% 부분 익절 30%%", pos.coin)
+            logger.info("[Engine] %s +%.0f%% 부분 익절 30%%", pos.coin, self._partial_tp1_pct * 100)
 
     async def _check_grid_fills(self, coin: str, ms: MarketState) -> None:
         """그리드 체결 확인 (Grid 전략 전용)."""
@@ -646,7 +695,12 @@ class TradingEngine:
         pass
 
     def _enforce_dry_run(self) -> None:
-        """trade_count < 200 → DRY_RUN 강제."""
+        """trade_count < 200 → DRY_RUN 강제.
+
+        engine._dry_run 과 UpbitClient._dry_run 을 반드시 동시에 설정해야 한다.
+        UpbitClient.place_limit_order / place_market_order 내부에서 _dry_run 플래그를
+        직접 체크하므로, client 인스턴스도 동기화하지 않으면 실거래 API가 호출된다.
+        """
         if self._state.trade_count < COLD_START_THRESHOLD:
             if not self._dry_run:
                 logger.warning(
@@ -654,7 +708,10 @@ class TradingEngine:
                     self._state.trade_count, COLD_START_THRESHOLD,
                 )
             self._dry_run = True
+            # 실제 API 호출을 막는 것은 UpbitClient._dry_run 이므로 반드시 함께 설정
+            self._client._dry_run = True
             assert self._dry_run is True  # CLAUDE.md 원칙 7번
+            assert self._client._dry_run is True  # client 동기화 보장
 
     def _reset_daily_counter(self) -> None:
         """날짜 변경 시 일일 거래 횟수 리셋."""
@@ -662,6 +719,46 @@ class TradingEngine:
         if self._state.last_trade_day != today:
             self._state.daily_trade_count = 0
             self._state.last_trade_day = today
+
+    def _check_price_circuits(self, market_states: list[MarketState]) -> None:
+        """각 코인의 현재가를 이력에 기록하고 가격 급락 서킷브레이커를 체크한다.
+
+        5분 루프 기준으로 이력을 관리한다:
+          - price_1m_ago:  1~6분 전 (직전 5분봉 close) 근사값
+          - price_10m_ago: 9분 이상 전 (2개 이전 5분봉 이상) 근사값
+
+        가격 이력이 충분하지 않은 초기 구동 시에는 체크를 건너뛴다.
+        """
+        now = datetime.now(timezone.utc)
+        for ms in market_states:
+            coin = ms.coin
+            current = ms.close_5m
+            if current <= 0:
+                continue
+
+            if coin not in self._price_history:
+                self._price_history[coin] = deque(maxlen=12)
+            history = self._price_history[coin]
+            history.append((now, current))
+
+            # 1분 전 / 10분 전 가격 근사 (이력 부족 시 current로 대체 → 급락 미발동)
+            price_1m_ago = current
+            price_10m_ago = current
+            for ts, price in history:
+                age_min = (now - ts).total_seconds() / 60
+                if 1 <= age_min <= 6 and price_1m_ago == current:
+                    price_1m_ago = price
+                if age_min >= 9 and price_10m_ago == current:
+                    price_10m_ago = price
+
+            self._cb.check_price_drop(
+                coin=coin,
+                price_1m_ago=price_1m_ago,
+                price_10m_ago=price_10m_ago,
+                current_price=current,
+                daily_loss_pct=self._state.daily_loss_pct,
+                cumulative_loss_24h=self._state.daily_loss_pct,
+            )
 
     def _is_in_cooldown(self, coin: str) -> bool:
         """재진입 쿨타임 확인."""
@@ -673,7 +770,7 @@ class TradingEngine:
     def _set_cooldown(self, coin: str) -> None:
         """재진입 쿨타임 설정."""
         self._state.reentry_cooldown[coin] = (
-            datetime.now(timezone.utc) + timedelta(minutes=REENTRY_COOLDOWN_MIN)
+            datetime.now(timezone.utc) + timedelta(minutes=self._reentry_cooldown)
         )
 
     # ------------------------------------------------------------------
@@ -685,7 +782,13 @@ class TradingEngine:
     ) -> dict[str, Any]:
         """Layer 1 필터 병렬 실행 (asyncio.gather)."""
         if self._layer1 is None:
-            # Layer1 미주입 시 전체 통과 처리 (테스트/초기 단계)
+            # 테스트 전용 폴백: Layer1 미주입 시 전 코인을 tradeable=True로 처리.
+            # 실거래 기동 시에는 setup_layers()로 반드시 Layer1을 주입해야 한다.
+            logger.error(
+                "[Engine] Layer1 미주입 — 전 코인(%d개) 필터 없이 통과 처리. "
+                "실거래라면 setup_layers(layer1=...) 호출 필요.",
+                len(market_states),
+            )
             return {
                 ms.coin: {
                     "tradeable": True,
@@ -711,7 +814,13 @@ class TradingEngine:
     ) -> dict[str, EnsemblePrediction]:
         """Layer 2 앙상블 예측 병렬 실행."""
         if self._layer2 is None:
-            # Layer2 미주입: 기본 예측 반환 (signal_confirmed=False)
+            # 테스트 전용 폴백: Layer2 미주입 시 임의 앙상블 점수(0.65)로 신호 확정.
+            # 실거래에서 이 경로가 실행되면 ML 검증 없이 매수 신호가 통과된다.
+            # 실거래 기동 시에는 setup_layers(layer2=...) 호출 필요.
+            logger.error(
+                "[Engine] Layer2 미주입 — ML 앙상블 없이 신호 확정(signal_confirmed=True) 처리. "
+                "실거래라면 setup_layers(layer2=...) 호출 필요.",
+            )
             return {
                 ms.coin: EnsemblePrediction(
                     coin=ms.coin,

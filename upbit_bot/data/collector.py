@@ -113,7 +113,10 @@ class PairlistManager:
             return pairs
         except Exception as exc:
             logger.error("페어리스트 갱신 실패: %s", exc)
-            return self._active_pairs  # 이전 목록 유지
+            # 의도적 폴백: 갱신 실패 시 이전 목록 유지.
+            # 빈 목록을 반환하면 WebSocket 구독이 취소되고 모든 데이터 수집이 멈추므로
+            # 이전 페어리스트로 계속 운영하는 것이 안전하다.
+            return self._active_pairs
 
     async def _fetch_krw_markets(self, session: aiohttp.ClientSession) -> list[str]:
         """업비트 KRW 마켓 전체 코인 목록."""
@@ -336,7 +339,7 @@ class UpbitWebSocketCollector:
                 change_rate=data.get("change_rate"),
             )
         except Exception as exc:
-            logger.debug("WebSocket 메시지 파싱 오류: %s", exc)
+            logger.warning("WebSocket 메시지 파싱 오류: %s", exc)
             return None
 
 
@@ -416,10 +419,10 @@ class KimchiPremiumCollector:
     환율: 한국은행 OpenAPI (일 1회 캐시)
     """
 
-    def __init__(self, bok_api_key: str = "", cache=None) -> None:
+    def __init__(self, bok_api_key: str = "", cache=None, usd_krw_initial: float = 1350.0) -> None:
         self._bok_api_key = bok_api_key
         self._cache = cache
-        self._usd_krw: float = 1350.0    # 기본값 (API 실패 시 fallback)
+        self._usd_krw: float = usd_krw_initial  # BOK API 실패 시 fallback — config.yaml data.usd_krw_initial
         self._last_bok_date: str = ""
         self._latest_premium: float = 0.0
 
@@ -430,7 +433,7 @@ class KimchiPremiumCollector:
             return self._usd_krw
 
         if not self._bok_api_key:
-            logger.debug("BOK API 키 없음 — USD/KRW 환율 캐시값 사용: %.1f", self._usd_krw)
+            logger.warning("BOK API 키 없음 — USD/KRW 환율 캐시값 사용: %.1f (김치프리미엄 정확도 저하)", self._usd_krw)
             return self._usd_krw
 
         try:
@@ -462,6 +465,7 @@ class KimchiPremiumCollector:
             # 업비트 BTC/KRW
             upbit_tickers = pyupbit.get_current_price("KRW-BTC")
             if not upbit_tickers:
+                logger.warning("업비트 BTC/KRW 조회 실패 — 김치프리미엄 이전값 유지: %.2f%%", self._latest_premium)
                 return self._latest_premium
             upbit_krw = float(upbit_tickers)
 
@@ -494,7 +498,7 @@ class KimchiPremiumCollector:
             return premium
 
         except Exception as exc:
-            logger.warning("김치프리미엄 수집 실패: %s", exc)
+            logger.error("김치프리미엄 수집 실패: %s — 이전값 유지 (의도적 폴백: 단기 API 오류 시 캐시 사용)", exc)
             return self._latest_premium
 
     @property
@@ -673,7 +677,10 @@ def _finbert_batch_worker(texts: list[str]) -> list[float]:
                 scores.append(0.0)
     except Exception as e:
         scores = [0.0] * len(texts)
-        print(f"[FinBERT Worker] 오류: {e}")
+        # ProcessPoolExecutor 격리 프로세스이므로 logger 대신 직접 출력 후,
+        # 부모 프로세스의 SentimentCollector가 FinBERT 실패를 감지하고 VADER로 폴백한다.
+        import logging as _logging
+        _logging.getLogger(__name__).error("[FinBERT Worker] 오류: %s — 더미 점수(0.0) 반환", e)
     finally:
         if model is not None:
             del model
@@ -845,6 +852,7 @@ class UpbitDataCollector:
         cryptoquant_key: str = "",
         blacklist: list[str] | None = None,
         finbert_pool: ProcessPoolExecutor | None = None,
+        yaml_config: dict | None = None,
     ) -> None:
         from data.cache import CandleCache, init_db
 
@@ -857,7 +865,10 @@ class UpbitDataCollector:
         self._ws_queue: asyncio.Queue[RawMarketData] = asyncio.Queue(maxsize=10_000)
         self._ws_collector = UpbitWebSocketCollector(self._ws_queue)
         self._market_idx = MarketIndexCollector(cache=self._cache)
-        self._kimchi = KimchiPremiumCollector(bok_api_key=bok_api_key, cache=self._cache)
+        _usd_krw_init = float((yaml_config or {}).get("data", {}).get("usd_krw_initial", 1350.0))
+        self._kimchi = KimchiPremiumCollector(
+            bok_api_key=bok_api_key, cache=self._cache, usd_krw_initial=_usd_krw_init
+        )
         self._obi = OBICollector()
         self._onchain = OnchainCollector(api_key=cryptoquant_key, cache=self._cache)
 
@@ -869,6 +880,12 @@ class UpbitDataCollector:
 
         self._rate_limiter = RateLimiter(max_per_second=8)
         self._session: aiohttp.ClientSession | None = None
+        self._cb: Any | None = None  # CircuitBreaker — set_circuit_breaker()로 후(後) 주입
+        self._ws_queue_task: asyncio.Task | None = None  # process_ws_queue 태스크 핸들
+
+    def set_circuit_breaker(self, cb: Any) -> None:
+        """CircuitBreaker 후(後) 주입 — engine 초기화 후 main.py에서 호출."""
+        self._cb = cb
 
     # ------------------------------------------------------------------
     # 초기화
@@ -882,9 +899,16 @@ class UpbitDataCollector:
         await self._refresh_pairlist()
         await self._initial_history_load()
         await self._ws_collector.start()
+        # ws_queue → CandleBuilder 소비 태스크 시작 (stop()에서 취소)
+        self._ws_queue_task = asyncio.create_task(
+            self.process_ws_queue(), name="ws_queue_consumer"
+        )
         logger.info("UpbitDataCollector 시작 완료")
 
     async def stop(self) -> None:
+        if self._ws_queue_task and not self._ws_queue_task.done():
+            self._ws_queue_task.cancel()
+            await asyncio.gather(self._ws_queue_task, return_exceptions=True)
         await self._ws_collector.stop()
         if self._session:
             await self._session.close()
@@ -943,6 +967,9 @@ class UpbitDataCollector:
                 df = pyupbit.get_ohlcv(coin, interval="day", count=400)
                 if df is not None and not df.empty:
                     df.index = pd.to_datetime(df.index, utc=True) if hasattr(df.index, 'tz') else df.index
+                    # daily_update()는 shift(1) 적용 후 SQLite(candles_1d)에 저장.
+                    # 반환값(df_shifted)은 현재 사용 안 함 — get_market_state_snapshot()이
+                    # 일봉 피처를 SQLite에서 직접 읽는 경로가 구현되면 여기서 활용 예정.
                     self._candle_builder.daily_update(coin, df)
                 await asyncio.sleep(0.1)
             except Exception as exc:
@@ -986,10 +1013,25 @@ class UpbitDataCollector:
     # ------------------------------------------------------------------
 
     async def process_ws_queue(self) -> None:
-        """asyncio.Queue에서 RawMarketData 꺼내 CandleBuilder 전달."""
+        """asyncio.Queue에서 RawMarketData 꺼내 CandleBuilder 전달.
+
+        stop() 호출 시 태스크가 cancel되어 CancelledError로 종료.
+        on_trade() 예외는 로깅 후 루프 유지 (서킷브레이커 오류 기록).
+        """
         while True:
-            msg = await self._ws_queue.get()
-            await self._candle_builder.on_trade(msg)
+            try:
+                msg = await self._ws_queue.get()
+            except asyncio.CancelledError:
+                break  # stop() → task.cancel() 시 정상 종료
+            try:
+                await self._candle_builder.on_trade(msg)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("[Collector] CandleBuilder.on_trade() 실패: %s", exc)
+                if self._cb is not None:
+                    self._cb.record_api_error()
+                # 예외 발생 시 루프 유지 — 다음 메시지 처리 계속
 
     # ------------------------------------------------------------------
     # MarketState 조회

@@ -36,14 +36,14 @@ def cache(tmp_db: Path) -> CandleCache:
 # ---------------------------------------------------------------------------
 
 class TestInitDb:
-    def test_creates_all_15_tables(self, tmp_db: Path):
+    def test_creates_all_16_tables(self, tmp_db: Path):
         conn = sqlite3.connect(str(tmp_db))
         cur = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         )
         tables = {r[0] for r in cur.fetchall()}
         conn.close()
-        assert len(tables) == 15
+        assert len(tables) == 16
 
     def test_idempotent(self, tmp_db: Path):
         """두 번 호출해도 오류 없어야 함."""

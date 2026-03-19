@@ -318,7 +318,8 @@ class Layer1MarketFilter:
         ema50 = ms.ema50_1d
         ema200 = ms.ema200_1d
         if ema50 <= 0 or ema200 <= 0:
-            return True, 1.0, ""  # 데이터 없으면 패스
+            logger.warning("[Layer1] %s 일봉 EMA 데이터 없음 — 조건4 스킵 (multiplier=1.0)", ms.coin)
+            return True, 1.0, ""
         if ema50 < ema200:
             return True, 0.8, f"일봉 데드크로스 (EMA50={ema50:.0f} < EMA200={ema200:.0f}) → ×0.8"
         return True, 1.0, ""

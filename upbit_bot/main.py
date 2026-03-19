@@ -78,12 +78,43 @@ except ImportError:
 # 환경변수 수집
 # ─────────────────────────────────────────────────────────────────
 
+def _load_yaml_config() -> dict:
+    """config.yaml 로드. 파일 없거나 파싱 실패 시 빈 dict 반환."""
+    import yaml  # PyYAML — requirements에 포함
+    config_path = _BOT_DIR / "config.yaml"
+    if not config_path.exists():
+        logger.warning("[main] config.yaml 없음 — 코드 기본값 사용")
+        return {}
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception as exc:
+        logger.error("[main] config.yaml 파싱 실패: %s — 코드 기본값 사용", exc)
+        return {}
+
+
 def _require_env(key: str) -> str:
     val = os.getenv(key, "")
     if not val:
         logger.error("[main] 필수 환경변수 미설정: %s", key)
         sys.exit(1)
     return val
+
+
+def _load_initial_capital() -> float:
+    """INITIAL_CAPITAL 환경변수 파싱. 미설정 시 경고 후 기본값 1천만원 사용."""
+    raw = os.getenv("INITIAL_CAPITAL", "")
+    if not raw:
+        logger.warning(
+            "[main] INITIAL_CAPITAL 미설정 — 기본값 10,000,000원 사용. "
+            "실거래 시 .env에 INITIAL_CAPITAL을 명시하라."
+        )
+        return 10_000_000.0
+    try:
+        return float(raw)
+    except ValueError:
+        logger.error("[main] INITIAL_CAPITAL 값 파싱 실패: '%s' — 기본값 10,000,000원 사용", raw)
+        return 10_000_000.0
 
 
 def _load_config() -> dict:
@@ -102,10 +133,11 @@ def _load_config() -> dict:
         "bok_api_key":    os.getenv("BOK_API_KEY", ""),
         "cryptoquant_key": os.getenv("CRYPTOQUANT_KEY", ""),
         "dry_run":        os.getenv("DRY_RUN", "true").lower() not in ("false", "0", "no"),
-        "initial_capital": float(os.getenv("INITIAL_CAPITAL", "10000000")),
+        "initial_capital": _load_initial_capital(),
         "db_path":        _BOT_DIR / os.getenv("DB_PATH", "data/bot.db"),
         "phase_b":        os.getenv("PHASE_B", "false").lower() in ("true", "1"),
         "phase_c":        os.getenv("PHASE_C", "false").lower() in ("true", "1"),
+        "yaml":           _load_yaml_config(),  # config.yaml 전체 (engine에서 사용)
     }
 
 
@@ -177,6 +209,7 @@ class BotApplication:
             db_path=str(self._cfg["db_path"]),
             bok_api_key=self._cfg["bok_api_key"],
             cryptoquant_key=self._cfg["cryptoquant_key"],
+            yaml_config=self._cfg.get("yaml", {}),
         )
         logger.info("[main] UpbitDataCollector 초기화 완료")
 
@@ -213,6 +246,7 @@ class BotApplication:
             upbit_client=client,
             dry_run=cfg["dry_run"],
             initial_capital=cfg["initial_capital"],
+            yaml_config=cfg.get("yaml", {}),
         )
 
         # 레이어 컴포넌트
@@ -244,7 +278,11 @@ class BotApplication:
         logger.info("[main] TradingEngine + 레이어 초기화 완료")
 
     def _step7_set_bot_context(self) -> None:
-        """7단계: 텔레그램 봇 컨텍스트 연결."""
+        """7단계: 텔레그램 봇 컨텍스트 연결 + 수집기에 서킷브레이커 주입."""
+        # 수집기에 서킷브레이커 후(後) 주입 — step4(collector)보다 step6(engine)이 늦게 초기화됨
+        if self._collector is not None and self._engine is not None:
+            self._collector.set_circuit_breaker(self._engine.circuit_breaker)
+
         from monitoring.telegram_bot import BotContext
         ctx = BotContext(
             engine=self._engine,
@@ -626,6 +664,9 @@ class BotApplication:
         """활성 페어리스트의 MarketState 수집."""
         from schema import MarketState
         states = []
+        if self._collector is None:
+            logger.warning("[main] collector 미초기화 — MarketState 수집 불가")
+            return states
         try:
             pairs = self._collector.pairlist.get_active_pairs()
             for coin in pairs:
@@ -633,7 +674,7 @@ class BotApplication:
                 if ms is not None:
                     states.append(ms)
         except Exception as exc:
-            logger.debug("[main] MarketState 수집 오류: %s", exc)
+            logger.warning("[main] MarketState 수집 오류: %s", exc)
         return states
 
     # ──────────────────────────────────────────────────────────────
@@ -660,6 +701,7 @@ class BotApplication:
                 await asyncio.sleep(SHUTDOWN_TELEGRAM_WAIT_SEC)
                 await self._telegram.stop()
             except Exception:
+                # 종료 중이므로 텔레그램 실패는 삼킴 — 로깅 시스템도 곧 닫힘
                 pass
 
         # 2. APScheduler 종료
@@ -668,6 +710,7 @@ class BotApplication:
                 self._scheduler.shutdown(wait=False)
                 logger.info("[main] APScheduler 종료")
             except Exception:
+                # 이미 종료된 스케줄러이거나 이벤트 루프 상태 이상 — 무시 후 계속
                 pass
 
         # 3. 데이터 수집기 종료
@@ -675,6 +718,7 @@ class BotApplication:
             try:
                 await self._collector.stop()
             except Exception:
+                # WebSocket/aiohttp 세션이 이미 닫혔을 수 있음 — 삼키고 계속
                 pass
 
         # 4. 엔진 종료 (ProcessPoolExecutor 포함)
@@ -682,6 +726,7 @@ class BotApplication:
             try:
                 self._engine.shutdown()
             except Exception:
+                # ProcessPoolExecutor가 이미 종료됐을 수 있음 — 삼키고 계속
                 pass
 
         # 5. DB 연결 종료
@@ -689,6 +734,7 @@ class BotApplication:
             try:
                 self._db_conn.close()
             except Exception:
+                # DB가 이미 닫혔거나 파일 핸들 이상 — 프로세스 종료 시 OS가 정리
                 pass
 
         logger.info("[main] 모든 컴포넌트 종료 완료")

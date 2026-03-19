@@ -237,12 +237,23 @@ class TelegramBot:
         chat_id: int | str = 0,
         event_queue: asyncio.Queue | None = None,
     ) -> None:
-        self._token   = token   or os.getenv("TELEGRAM_TOKEN", "")
-        self._chat_id = int(chat_id or os.getenv("TELEGRAM_CHAT_ID", "0"))
+        resolved_token = token or os.getenv("TELEGRAM_TOKEN", "")
+        if not resolved_token:
+            raise ValueError(
+                "TELEGRAM_TOKEN 미설정 — .env 또는 환경변수에 TELEGRAM_TOKEN을 추가하라."
+            )
+        resolved_chat_id = int(chat_id or os.getenv("TELEGRAM_CHAT_ID", "0"))
+        if resolved_chat_id == 0:
+            raise ValueError(
+                "TELEGRAM_CHAT_ID 미설정 또는 0 — .env 또는 환경변수에 TELEGRAM_CHAT_ID를 추가하라."
+            )
+        self._token   = resolved_token
+        self._chat_id = resolved_chat_id
         self._queue: asyncio.Queue[dict[str, Any]] = event_queue or asyncio.Queue()
         self._ctx = BotContext()
         self._app: Any = None
         self._formatter = MessageFormatter()
+        self._shutdown_event: asyncio.Event | None = None  # start()에서 주입
 
     def set_context(self, ctx: BotContext) -> None:
         self._ctx = ctx
@@ -271,6 +282,7 @@ class TelegramBot:
         )
         self._register_handlers()
 
+        self._shutdown_event = shutdown_event  # 루프에서 종료 신호 체크용
         logger.info("[TelegramBot] 시작 chat_id=%d", self._chat_id)
         async with self._app:
             await self._app.start()
@@ -346,8 +358,15 @@ class TelegramBot:
     # ------------------------------------------------------------------
 
     async def _queue_dispatch_loop(self) -> None:
-        """큐에서 메시지를 꺼내 텔레그램으로 전송. 재시도 3회."""
+        """큐에서 메시지를 꺼내 텔레그램으로 전송. 재시도 3회.
+
+        종료 신호: start()에서 dispatch_task.cancel() 호출 → CancelledError → break.
+        self._shutdown_event 직접 체크는 _queue.get() 대기 중에도 응답 가능.
+        """
         while True:
+            # 종료 신호 체크 — task.cancel() 없이도 shutdown_event로 루프 탈출
+            if self._shutdown_event is not None and self._shutdown_event.is_set():
+                break
             try:
                 item = await self._queue.get()
                 await self._send_with_retry(
@@ -356,7 +375,7 @@ class TelegramBot:
                 )
                 self._queue.task_done()
             except asyncio.CancelledError:
-                break
+                break  # start()의 dispatch_task.cancel() → 정상 종료
             except Exception as exc:
                 logger.error("[TelegramBot] 큐 디스패치 오류: %s", exc)
 

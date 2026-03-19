@@ -162,8 +162,7 @@ class UpbitClient:
                 "spread_pct": spread,
             }
         except Exception as exc:
-            logger.error("[UpbitClient] 호가창 조회 실패: %s", exc)
-            return {}
+            raise UpbitAPIError(500, f"호가창 조회 실패: {exc}") from exc
 
     async def place_limit_order(
         self,
@@ -564,7 +563,11 @@ class SmartOrderRouter:
         # 체결 정보 조회
         try:
             info = await self._client.get_order(order_id)
-        except UpbitAPIError:
+        except UpbitAPIError as exc:
+            # 의도적 폴백: 시장가 주문은 이미 체결 완료이므로 취소 불가.
+            # get_order 실패 시 current_price / krw_amount 기반 추정값으로 대체.
+            # 이 경우 체결가·수량·수수료가 부정확하게 기록될 수 있으므로 error로 남긴다.
+            logger.error("[SmartOrderRouter] 시장가 체결 정보 조회 실패 — 추정값 사용: %s", exc)
             info = {}
 
         executed_vol = float(info.get("executed_volume", req.krw_amount / max(req.current_price, 1)))

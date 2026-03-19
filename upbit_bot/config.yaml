@@ -23,6 +23,18 @@ trading:
   min_position_krw: 50000       # 최소 단일 투자금 KRW
   max_single_pct: 0.30          # 단일 포지션 최대 자본 비율 (30%)
   entry_delay_max_sec: 90       # 진입 랜덤 지연 최대 초 (front-running 방어)
+  min_hold_minutes: 15          # 최소 보유 시간 (분)
+  reentry_cooldown_min: 10      # 동일 코인 재진입 대기 (분)
+  hard_stop_loss_pct: -0.07     # 하드 손절 기준 (-7%)
+  partial_tp1_pct: 0.10         # 1차 부분 익절 기준 (+10%)
+  partial_tp2_pct: 0.20         # 2차 부분 익절 기준 (+20%)
+  var_max_pct: 0.03             # 진입 허용 VaR 상한 (자본의 3%)
+  tick_imbalance_min: 0.10      # 진입 트리거 최소 tick imbalance
+  obi_min: 0.20                 # 진입 트리거 최소 OBI
+  reentry_tick_min: 0.15        # 재진입 조건: tick imbalance 최소값
+  reentry_rsi_min: 40.0         # 재진입 조건: RSI 하한
+  reentry_rsi_max: 65.0         # 재진입 조건: RSI 상한
+  reentry_obi_min: 0.10         # 재진입 조건: OBI 최소값
 
 # ─────────────────────────────────────────────────────────────────
 # 페어리스트
@@ -74,6 +86,8 @@ kelly:
   max_single_pct: 0.30          # 단일 포지션 상한 (30%)
   consecutive_penalty: 0.10     # 연속 손실 1회당 추가 감소 비율
   var_confidence: 0.95          # 역사적 VaR 신뢰 수준
+  atr_high_threshold: 0.03      # ATR/가격 > 3% → HIGH 변동성
+  atr_low_threshold: 0.005      # ATR/가격 < 0.5% → LOW 변동성
 
 # ─────────────────────────────────────────────────────────────────
 # 트레일링 스탑
@@ -136,6 +150,7 @@ data:
   websocket_reconnect_delay_sec: 5    # WebSocket 재연결 대기
   candle_history_days: 90             # REST 초기 로딩 기간 (일)
   quality_check_interval_min: 60      # DataQualityChecker 실행 주기 (분)
+  usd_krw_initial: 1350.0             # USD/KRW 환율 초기값 (BOK API 실패 시 fallback)
 
 # ─────────────────────────────────────────────────────────────────
 # StorageManager

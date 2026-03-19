@@ -201,7 +201,8 @@ class LookaheadBiasChecker:
 
         try:
             df_sorted = df.sort_index()
-        except Exception:
+        except Exception as exc:
+            logger.warning("[LookaheadCheck] DataFrame 정렬 실패 — 순서 검사 건너뜀: %s", exc)
             return violations
 
         for sig_ts in signal_timestamps[:100]:  # 100개 샘플링
@@ -262,7 +263,8 @@ class LookaheadBiasChecker:
                     loc = df_sorted.index.searchsorted(ts)
                     if loc < len(df_sorted):
                         sample_idx.append(loc)
-                except Exception:
+                except Exception as exc:
+                    logger.warning("[LookaheadCheck] 샘플 인덱스 계산 실패: %s", exc)
                     continue
 
             if not sample_idx:
@@ -286,7 +288,8 @@ class LookaheadBiasChecker:
                             "[LookaheadCheck] 미래 수익률 상관 과다: col=%s corr=%.4f",
                             col, corr,
                         )
-                except Exception:
+                except Exception as exc:
+                    logger.warning("[LookaheadCheck] 컬럼 %s 상관 계산 실패: %s", col, exc)
                     continue
         except Exception as exc:
             logger.warning("[LookaheadCheck] 상관 검사 실패: %s", exc)
