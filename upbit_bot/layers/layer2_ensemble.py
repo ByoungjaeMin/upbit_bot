@@ -202,12 +202,16 @@ class Layer2Ensemble:
         cache: Any = None,
         trade_count_fn: Callable[[], int] | None = None,
         threshold: float = THRESHOLD_DEFAULT,
-        phase_b_enabled: bool = False,   # LSTM/GRU 활성화 (Phase B 이후)
-        retrain_interval: int = 50,      # 신규 샘플 N개마다 자동 재학습
+        consensus_threshold: float = 0.5,  # 개별 모델 합의 판정 임계값 (앙상블 임계값과 별개)
+        phase_b_enabled: bool = False,     # LSTM/GRU 활성화 (Phase B 이후)
+        retrain_interval: int = 50,        # 신규 샘플 N개마다 자동 재학습
     ) -> None:
         self._cache = cache
         self._trade_count_fn: Callable[[], int] = trade_count_fn or (lambda: 0)
         self._threshold = threshold
+        # 개별 모델 합의 판정 임계값 — 앙상블 최종 임계값(self._threshold=0.62)과 분리.
+        # 기획서: "앙상블 가중 평균 >= 0.62 AND 3모델 이상 합의"에서 합의 기준은 별개.
+        self._consensus_threshold = consensus_threshold
         self._phase_b = phase_b_enabled and _TORCH_AVAILABLE
         self._retrain_interval = retrain_interval
         self._lock = threading.Lock()
@@ -274,6 +278,12 @@ class Layer2Ensemble:
 
             if self._phase_b and trade_count >= 500:
                 per_model.update(self._predict_seq_models(ms.coin))
+            else:
+                # 의도적: Phase B 비활성 시 가중치 0 유지 (분모 고정 목적).
+                # per_model에 포함시켜 total_w 분모가 항상 3.6(xgb+lgb+lstm+gru)으로
+                # 고정되도록 함 — 모델 추가/제거에 따른 threshold 판정 기준 변동 방지.
+                per_model["lstm"] = 0.0
+                per_model["gru"] = 0.0
 
         pred = self._build_prediction(per_model, ms)
         self._save_to_db(pred)
@@ -348,7 +358,11 @@ class Layer2Ensemble:
             if not self._scaler_fitted:
                 self._scaler.fit(X)
                 self._scaler_fitted = True
-            X_scaled = self._scaler.transform(X)
+            # 청크 단위 transform — 전량 적재 시 M4 16GB RAM OOM 방지 (기획서 하드웨어 제약)
+            _chunk = 10_000
+            X_scaled = np.concatenate(
+                [self._scaler.transform(X[i:i + _chunk]) for i in range(0, len(X), _chunk)]
+            )
 
         xgb = XGBClassifier(**_XGB_PARAMS[regime_group])
         xgb.fit(X_scaled, y, sample_weight=w)
@@ -448,9 +462,13 @@ class Layer2Ensemble:
     # ------------------------------------------------------------------
 
     def _init_seq_models(self) -> None:
-        """LSTM + GRU 초기화 (device=cpu 강제)."""
-        self._lstm = _LSTMModel()
-        self._gru = _GRUModel()
+        """LSTM + GRU 초기화 (device=cpu 강제).
+
+        .to("cpu") 명시: load_checkpoint()의 map_location="cpu"와 일관성 유지.
+        MPS/CUDA 환경에서 추론 텐서와 device mismatch 방지.
+        """
+        self._lstm = _LSTMModel().to("cpu")
+        self._gru = _GRUModel().to("cpu")
         self._lstm_opt = torch.optim.Adam(self._lstm.parameters(), lr=0.001)
         self._gru_opt = torch.optim.Adam(self._gru.parameters(), lr=0.001)
         logger.info("[Layer2] LSTM + GRU 모델 초기화 (device=cpu)")
@@ -461,11 +479,17 @@ class Layer2Ensemble:
 
     @staticmethod
     def _extract_features(ms: MarketState) -> np.ndarray:
-        """MarketState → np.ndarray (35,). 누락 피처는 0.0 처리."""
-        return np.array(
-            [getattr(ms, col, 0.0) for col in FEATURE_COLS],
-            dtype=np.float32,
-        )
+        """MarketState → np.ndarray (35,).
+
+        누락 피처 발견 시 즉시 ValueError — 0.0은 실제 값(exchange_inflow=0.0)과
+        구분 불가하므로 조용한 잘못된 예측보다 명시적 실패가 안전하다.
+        """
+        vals: list[float] = []
+        for col in FEATURE_COLS:
+            if not hasattr(ms, col):
+                raise ValueError(f"누락 피처: {col}")
+            vals.append(float(getattr(ms, col)))
+        return np.array(vals, dtype=np.float32)
 
     # ------------------------------------------------------------------
     # 내부: 레짐 그룹 분류
@@ -523,6 +547,8 @@ class Layer2Ensemble:
         result: dict[str, float] = {}
 
         with self._lock:
+            # 의도적 폴백: conservative 모델 미학습 시 aggressive 모델 대체.
+            # 이유: 모델 없이 예측 불가보다 보수적 폴백이 안전.
             xgb = self._xgb.get(regime_group) or self._xgb.get("aggressive")
             lgb = self._lgb.get(regime_group) or self._lgb.get("aggressive")
 
@@ -554,7 +580,7 @@ class Layer2Ensemble:
             return {}
 
         seq = np.array(list(buf), dtype=np.float32)          # (60, 35)
-        x = torch.tensor(seq).unsqueeze(0)                   # (1, 60, 35)
+        x = torch.tensor(seq).unsqueeze(0).to("cpu")         # (1, 60, 35) cpu 강제
         result: dict[str, float] = {}
 
         with torch.no_grad():
@@ -592,7 +618,7 @@ class Layer2Ensemble:
             w = MODEL_WEIGHTS.get(name, 0.6)
             weighted_sum += prob * w
             total_w += w
-            if prob >= self._threshold:
+            if prob >= self._consensus_threshold:
                 consensus_count += 1
 
         weighted_avg = weighted_sum / total_w if total_w > 0 else 0.0
@@ -640,7 +666,8 @@ class Layer2Ensemble:
             }
             self._cache.upsert_candle("ensemble_predictions", pred.coin, row)
         except Exception as exc:
-            logger.error("[Layer2] DB 저장 실패: %s", exc)
+            logger.warning("[Layer2] DB 저장 실패: %s", exc)
+            # 의도적 계속 진행: 예측 결과 DB 저장 실패는 트레이딩 중단 사유 아님
 
     # ------------------------------------------------------------------
     # 내부: 주기적 전체 재학습

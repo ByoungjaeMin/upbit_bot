@@ -165,6 +165,20 @@ class Layer1MarketFilter:
                 regime_strategy=regime,
             )
 
+        # ------ 조건 10: API 레이턴시 ------
+        # 조건 9(클러스터) 이전에 배치 — Phase C 활성화 시 클러스터 차단으로
+        # 레이턴시 로그가 누락되는 것을 방지한다.
+        lat_ok, lat_warn = self._cond10_latency(ms)
+        if lat_warn:
+            warnings.append(lat_warn)
+        if not lat_ok:
+            return self._build_result(
+                ms, coin, tradeable=False,
+                multiplier=0.0, warnings=warnings,
+                regime_strategy=regime,
+                api_latency_ok=False,
+            )
+
         # ------ 조건 9: 코인 클러스터 (Phase C만) ------
         if self._phase_c:
             cluster_ok, cluster_warn = self._cond9_cluster(coin)
@@ -176,18 +190,6 @@ class Layer1MarketFilter:
                     multiplier=0.0, warnings=warnings,
                     regime_strategy=regime,
                 )
-
-        # ------ 조건 10: API 레이턴시 ------
-        lat_ok, lat_warn = self._cond10_latency(ms)
-        if lat_warn:
-            warnings.append(lat_warn)
-        if not lat_ok:
-            return self._build_result(
-                ms, coin, tradeable=False,
-                multiplier=0.0, warnings=warnings,
-                regime_strategy=regime,
-                api_latency_ok=False,
-            )
 
         # ------ 김치프리미엄 추가 필터 ------
         kimchi_mult, kimchi_warn = self._kimchi_premium_filter(ms)
@@ -348,7 +350,9 @@ class Layer1MarketFilter:
         details.append(f"1h EMA20{'>'if r5b else '<'}EMA50")
 
         # 5c: 일봉 EMA50 > EMA200 (shift(1) 적용값)
-        r5c = ms.ema50_1d > ms.ema200_1d if (ms.ema50_1d > 0 and ms.ema200_1d > 0) else True
+        # daily_update() 미실행 초기 기본값 0.0 → 데이터 없음으로 간주하여 False 처리.
+        # True로 처리하면 골든크로스로 잘못 판정되어 MTF 통과 카운트가 늘어난다.
+        r5c = ms.ema50_1d > ms.ema200_1d if (ms.ema50_1d > 0 and ms.ema200_1d > 0) else False
         results.append(r5c)
         details.append(f"1d EMA50{'>'if r5c else '<'}EMA200")
 
@@ -558,7 +562,8 @@ class Layer1MarketFilter:
             }
             self._cache.upsert_candle("layer1_log", result.coin, row)
         except Exception as exc:
-            logger.error("layer1_log 저장 실패: %s", exc)
+            logger.warning("layer1_log 저장 실패: %s", exc)
+            # 의도적 계속 진행: 로그 저장 실패는 트레이딩 중단 사유 아님
 
     # ------------------------------------------------------------------
     # 저유동성 사전 제외

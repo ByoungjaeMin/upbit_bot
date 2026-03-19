@@ -312,15 +312,16 @@ class TestCancelWithRaceGuard:
         result = run(router.cancel_with_race_guard("fake-id"))
         assert result == OrderResult.FULLY_FILLED
 
-    def test_unexpected_error_returns_failed(self):
+    def test_unexpected_error_raises(self):
+        """400 외 예외는 FAILED 반환 대신 즉시 전파."""
         router = _router()
 
         async def mock_cancel(_):
             raise UpbitAPIError(500, "server error")
 
         router._client.cancel_order = mock_cancel
-        result = run(router.cancel_with_race_guard("fake-id"))
-        assert result == OrderResult.FAILED
+        with pytest.raises(UpbitAPIError):
+            run(router.cancel_with_race_guard("fake-id"))
 
 
 # ---------------------------------------------------------------------------

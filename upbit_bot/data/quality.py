@@ -15,9 +15,14 @@ data/quality.py — DataQualityChecker 7단계 파이프라인
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from risk.circuit_breaker import CircuitBreaker
 
 import numpy as np
 import pandas as pd
@@ -73,6 +78,16 @@ class QualityReport:
 # DataQualityChecker
 # ------------------------------------------------------------------
 
+def _run_isolation_forest(feats_values: "np.ndarray") -> "np.ndarray":
+    """IsolationForest fit_predict — run_in_executor 격리용 모듈 레벨 함수.
+
+    step5_anomaly_detection에서 await loop.run_in_executor(None, _run_isolation_forest, feats.values)
+    형태로 호출한다. 스레드 풀에서 실행되므로 asyncio 이벤트 루프를 블로킹하지 않는다.
+    """
+    iso = IsolationForest(contamination=0.05, random_state=42, n_estimators=100)
+    return iso.fit_predict(feats_values)
+
+
 class DataQualityChecker:
     """7단계 데이터 품질 검증 파이프라인.
 
@@ -82,17 +97,24 @@ class DataQualityChecker:
                                                       ws_price=95_000_000.0)
     """
 
-    def __init__(self, cache=None) -> None:
+    def __init__(
+        self,
+        cache=None,
+        circuit_breaker: CircuitBreaker | None = None,
+    ) -> None:
         """
-        cache: CandleCache 인스턴스 (리포트 저장용, 선택적)
+        cache:            CandleCache 인스턴스 (리포트 저장용, 선택적)
+        circuit_breaker:  CircuitBreaker 인스턴스 (Level 4 발동용, 선택적)
+                          None이면 trigger 호출 스킵 + logger.warning 경고
         """
         self._cache = cache
+        self._cb = circuit_breaker
 
     # ------------------------------------------------------------------
     # 메인 파이프라인
     # ------------------------------------------------------------------
 
-    def validate_pipeline(
+    async def validate_pipeline(
         self,
         df: pd.DataFrame,
         interval: str,
@@ -110,7 +132,7 @@ class DataQualityChecker:
         df, report = self.step2_timestamp(df, interval, report)
         df, report = self.step3_volume_outliers(df, report)
         df, report = self.step4_price_outliers(df, report)
-        df, report = self.step5_anomaly_detection(df, report)
+        df, report = await self.step5_anomaly_detection(df, report)
         report = self.step6_freshness(df, interval, report)
         if ws_price is not None:
             report = self.step7_cross_validate(df, ws_price, report)
@@ -277,7 +299,7 @@ class DataQualityChecker:
     # step5: IsolationForest 이상 감지
     # ------------------------------------------------------------------
 
-    def step5_anomaly_detection(
+    async def step5_anomaly_detection(
         self, df: pd.DataFrame, report: QualityReport
     ) -> tuple[pd.DataFrame, QualityReport]:
         if len(df) < 50:   # 데이터 부족 시 스킵
@@ -296,8 +318,9 @@ class DataQualityChecker:
         )
         feats = feats.replace([np.inf, -np.inf], 0).fillna(0)
 
-        iso = IsolationForest(contamination=0.05, random_state=42, n_estimators=100)
-        preds = iso.fit_predict(feats.values)
+        # IsolationForest CPU 작업 — 스레드 풀로 격리 (이벤트 루프 블로킹 방지)
+        loop = asyncio.get_event_loop()
+        preds = await loop.run_in_executor(None, _run_isolation_forest, feats.values)
 
         anomaly_mask = preds == -1
         df = df.copy()
@@ -341,6 +364,10 @@ class DataQualityChecker:
             report.warnings.append(
                 f"데이터 심각한 지연 {lag.total_seconds():.0f}초 — Level 4 연동"
             )
+            if self._cb is not None:
+                self._cb.trigger(4, f"데이터 심각한 지연 {lag.total_seconds():.0f}초")
+            else:
+                logger.warning("[품질검증] 서킷브레이커 미주입 — Level 4 발동 스킵 (데이터 지연)")
         elif lag > max_lag:
             report.stale_data = True
             report.warnings.append(f"데이터 지연 {lag.total_seconds():.0f}초")
@@ -369,6 +396,10 @@ class DataQualityChecker:
             report.warnings.append(
                 f"WebSocket vs REST 괴리 {deviation:.2%} > 3% — Level 4 연동"
             )
+            if self._cb is not None:
+                self._cb.trigger(4, f"WebSocket vs REST 괴리 {deviation:.2%}")
+            else:
+                logger.warning("[품질검증] 서킷브레이커 미주입 — Level 4 발동 스킵 (WS/REST 괴리)")
         elif deviation > 0.01:
             report.source_warning = True
             report.warnings.append(

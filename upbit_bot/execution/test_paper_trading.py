@@ -14,6 +14,7 @@ from execution.paper_trading import (
     PaperPortfolio,
     PaperTradeRecord,
     PaperTradingRunner,
+    _insert_paper_trades,
 )
 
 
@@ -226,3 +227,77 @@ class TestPaperTradingRunner:
         runner.on_live_executed("loop-1", 50_000_000)
         runner.on_live_executed("loop-2", 3_000_000)
         assert len(runner._completed) == 2
+
+
+# ---------------------------------------------------------------------------
+# _insert_paper_trades / compute_metrics DB 저장 검증
+# ---------------------------------------------------------------------------
+
+class TestPaperTradingDb:
+    def _metrics(self) -> ComparisonMetrics:
+        return ComparisonMetrics(
+            window_size=10,
+            signal_match_rate=0.90,
+            avg_price_deviation_pct=-0.05,
+            avg_timing_slippage_sec=2.3,
+        )
+
+    def test_insert_creates_table_and_row(self, tmp_path):
+        """_insert_paper_trades 호출 후 테이블과 행 생성 확인."""
+        import sqlite3
+        db_path = str(tmp_path / "test.db")
+        _insert_paper_trades(self._metrics(), db_path, "BTC", "TREND")
+
+        conn = sqlite3.connect(db_path)
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        count = conn.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0]
+        conn.close()
+
+        assert "paper_trades" in tables
+        assert count == 1
+
+    def test_insert_columns_match(self, tmp_path):
+        """INSERT된 행의 컬럼 값 검증."""
+        import sqlite3
+        db_path = str(tmp_path / "test.db")
+        m = self._metrics()
+        _insert_paper_trades(m, db_path, "ETH", "GRID")
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM paper_trades").fetchone()
+        conn.close()
+
+        assert row["coin"] == "ETH"
+        assert row["strategy"] == "GRID"
+        assert row["signal_match_rate"] == pytest.approx(0.90, abs=1e-6)
+        assert row["price_deviation"] == pytest.approx(-0.05, abs=1e-6)
+        assert row["timing_slippage"] == pytest.approx(2.3, abs=1e-6)
+        assert row["timestamp"] != ""
+
+    def test_insert_raises_on_invalid_path(self):
+        """존재하지 않는 디렉토리 경로 → sqlite3.OperationalError 전파 확인."""
+        import sqlite3
+        bad_path = "/nonexistent_dir/sub/test.db"
+        with pytest.raises(sqlite3.OperationalError):
+            _insert_paper_trades(self._metrics(), bad_path, "ALL", "ALL")
+
+    def test_compute_metrics_with_db_path_saves_row(self, tmp_path):
+        """compute_metrics(db_path=...) 호출 시 paper_trades에 INSERT됨."""
+        import sqlite3
+        db_path = str(tmp_path / "test.db")
+        runner = PaperTradingRunner(initial_capital=10_000_000)
+        runner.on_signal("BTC", "BUY", 50_000_000, 100_000, "TREND", "loop-1")
+        runner.on_live_executed("loop-1", 50_000_000)
+
+        runner.compute_metrics(db_path=db_path, coin="BTC", strategy="TREND")
+
+        conn = sqlite3.connect(db_path)
+        count = conn.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0]
+        conn.close()
+        assert count == 1

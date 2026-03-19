@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from risk.circuit_breaker import CircuitBreaker
+from data.quality import DataQualityChecker
 from schema import (
     EnsemblePrediction,
     FilterResult,
@@ -164,6 +165,10 @@ class TradingEngine:
         # 서킷브레이커 (최우선)
         self._cb = CircuitBreaker()
 
+        # 데이터 품질 검증 (circuit_breaker 주입으로 Level 4 자동 발동)
+        self._quality_checker = DataQualityChecker(circuit_breaker=self._cb)
+        self._candle_builder: Any = None  # set_candle_builder()로 주입
+
         # 주문 실행
         self._client = upbit_client or UpbitClient(dry_run=dry_run)
         self._router = SmartOrderRouter(self._client)
@@ -182,6 +187,11 @@ class TradingEngine:
 
         # 이벤트 큐 (텔레그램 비동기 전송용)
         self._telegram_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        # Phase 자동 전환 감지 (DRY_RUN → 실거래 검토 알림)
+        self._telegram_cb: Any = None          # main.py에서 set_telegram_callback()으로 주입
+        self._cold_start_notified: bool = False  # 200건 달성 알림 1회 방지
+        self._db_path: str | None = None       # main.py에서 set_db_path()로 주입
 
         # 가격 이력 (서킷브레이커 가격 급락 감지용, 코인당 최대 12개 = 1시간)
         self._price_history: dict[str, deque[tuple[datetime, float]]] = {}
@@ -210,6 +220,10 @@ class TradingEngine:
         self._strategy_selector = strategy_selector
         self._decay_monitor = decay_monitor
 
+    def set_candle_builder(self, candle_builder: Any) -> None:
+        """CandleBuilder 주입 — DataQualityChecker 품질 검증용."""
+        self._candle_builder = candle_builder
+
     # ------------------------------------------------------------------
     # 공개 루프 (APScheduler에서 호출)
     # ------------------------------------------------------------------
@@ -226,19 +240,21 @@ class TradingEngine:
         decisions: list[TradeDecision] = []
         self._reset_daily_counter()
 
-        # Step 1: 서킷브레이커 상태 확인 (최우선)
-        if self._cb.is_all_blocked():
-            logger.warning("[Engine] 서킷브레이커 Level %d — 전체 차단", self._cb.level)
-            return decisions
-
-        # Step 1.5: 가격 급락 서킷브레이커 체크 + Level 1 매수 차단 확인
+        # Step 1: 가격 급락 서킷브레이커 체크 — 레벨 에스컬레이션(1→2→3) 감지를 위해
+        #         매수 차단 판단보다 반드시 먼저 실행해야 함.
         self._check_price_circuits(market_states)
+
+        # Step 1.5: 매수 차단 확인 (Level 1+) — 신규 진입 판단이므로 is_buy_blocked() 사용
         if self._cb.is_buy_blocked():
             logger.warning("[Engine] 서킷브레이커 Level %d — 매수 차단 (포지션 모니터링은 유지)", self._cb.level)
             return decisions
 
         # Step 2: DRY_RUN 강제 체크
         self._enforce_dry_run()
+
+        # Step 2.5: DataQualityChecker 7단계 품질 검증 — score < 0.5 코인 제외
+        if self._candle_builder is not None:
+            market_states = await self._filter_by_quality(market_states)
 
         # Step 3~5: 각 코인 필터 병렬 실행
         filter_results = await self._run_layer1_parallel(market_states)
@@ -285,7 +301,9 @@ class TradingEngine:
 
     async def position_loop(self, market_states: list[MarketState]) -> None:
         """1분 포지션 모니터링 루프."""
-        if self._cb.is_all_blocked():
+        # 청산 차단 확인 (Level 3+) — 포지션 청산은 SELL이므로 is_sell_blocked() 사용.
+        # Level 2는 신규 진입만 차단; SELL은 허용하여 "전량 USDT 전환"이 가능하다.
+        if self._cb.is_sell_blocked():
             return
 
         price_map = {ms.coin: ms.close_5m for ms in market_states}
@@ -534,6 +552,8 @@ class TradingEngine:
             self._positions[ms.coin] = pos
             self._state.trade_count += 1
             self._state.daily_trade_count += 1
+            # trade_count가 COLD_START_THRESHOLD(200)에 도달 시 실거래 전환 검토 알림
+            await self._check_cold_start_threshold()
 
         decision = TradeDecision(
             coin=ms.coin,
@@ -713,12 +733,257 @@ class TradingEngine:
             assert self._dry_run is True  # CLAUDE.md 원칙 7번
             assert self._client._dry_run is True  # client 동기화 보장
 
+    # ------------------------------------------------------------------
+    # 텔레그램 / DB 콜백 주입 (외부 설정)
+    # ------------------------------------------------------------------
+
+    def set_telegram_callback(self, callback: Any) -> None:
+        """텔레그램 전송 콜백 주입.
+
+        main.py에서 TelegramBot.send를 주입:
+            engine.set_telegram_callback(telegram_bot.send)
+
+        미주입 시 200건 달성 알림이 로거로만 출력된다.
+        """
+        self._telegram_cb = callback
+
+    def set_db_path(self, db_path: str) -> None:
+        """SQLite DB 경로 주입.
+
+        main.py에서 초기화 직후 호출:
+            engine.set_db_path(str(cfg["db_path"]))
+
+        미주입 시 7가지 체크리스트 조회를 건너뛴다.
+        """
+        self._db_path = db_path
+
+    # ------------------------------------------------------------------
+    # Phase 자동 전환 감지
+    # ------------------------------------------------------------------
+
+    async def _check_cold_start_threshold(self) -> None:
+        """trade_count가 COLD_START_THRESHOLD(200)에 도달하면 1회 텔레그램 알림.
+
+        - 정확히 200 도달 시에만 1회 실행 (_cold_start_notified로 중복 방지)
+        - DRY_RUN 강제 해제 여부는 _enforce_dry_run()이 담당
+          이 메서드는 "검토 필요" 알림만 전송하며 실거래 전환을 자동으로 하지 않는다
+        - 운영자가 직접 확인 후 수동으로 DRY_RUN=false 설정
+        """
+        if self._cold_start_notified:
+            return
+        if self._state.trade_count != COLD_START_THRESHOLD:
+            return
+
+        self._cold_start_notified = True
+        logger.info(
+            "[Engine] trade_count=%d 달성 — 실거래 전환 검토 알림 전송",
+            self._state.trade_count,
+        )
+
+        # 7가지 체크리스트 조회 (IO 블로킹이므로 to_thread)
+        failures = await asyncio.to_thread(self._run_live_readiness_check)
+
+        if failures:
+            status_line = f"⚠️ 미통과 항목 {len(failures)}개 — 실거래 전환 보류"
+        else:
+            status_line = "✅ 7가지 기준 모두 통과 — 실거래 전환 가능"
+
+        msg_lines = [
+            "<b>🎯 페이퍼 트레이딩 200건 달성</b>",
+            "실거래 전환 검토를 시작하세요.",
+            "",
+            f"<b>7가지 체크리스트 현황:</b> {status_line}",
+        ]
+        for f in failures:
+            msg_lines.append(f"  • {f}")
+        msg_lines += [
+            "",
+            "⚠️ DRY_RUN=false 설정 전 모든 항목을 직접 확인하세요.",
+            "⚠️ trade_count가 200 미만으로 리셋되면 DRY_RUN이 자동 재강제됩니다.",
+        ]
+        msg = "\n".join(msg_lines)
+
+        if self._telegram_cb is not None:
+            try:
+                await self._telegram_cb(msg, priority=1)
+            except Exception as exc:
+                logger.error("[Engine] 200건 달성 텔레그램 알림 실패: %s", exc)
+        else:
+            logger.warning("[Engine] telegram_cb 미주입 — 200건 알림 로거 출력:\n%s", msg)
+
+    def _run_live_readiness_check(self) -> list[str]:
+        """실전 전환 7가지 체크리스트 조회 (동기 — asyncio.to_thread로 호출).
+
+        항목:
+          ① 샤프비율 > 1.5         (wf_summary)
+          ② 최대낙폭 < 20%         (trades)
+          ③ 승률 > 55%             (trades)
+          ④ 하락장 낙폭 < 10%      (wf_summary.failures_json)
+          ⑤ Lookahead Bias 0개     (wf_summary.failures_json)
+          ⑥ Monte Carlo p < 0.05  (backtest_results)
+          ⑦ DRY_RUN 48시간 정상   (trades 최초 기록 기준)
+
+        Returns:
+            미통과 항목 설명 목록 (비어있으면 실전 전환 가능)
+        """
+        import json as _json
+        import sqlite3 as _sqlite3
+
+        failures: list[str] = []
+
+        if not self._db_path:
+            raise RuntimeError(
+                "_run_live_readiness_check: db_path 미설정 — "
+                "set_db_path() 호출 필요"
+            )
+
+        try:
+            conn = _sqlite3.connect(str(self._db_path))
+            conn.row_factory = _sqlite3.Row
+            try:
+                # ─── ①④⑤: Walk-Forward 결과 ─────────────────────────
+                try:
+                    wf_row = conn.execute(
+                        "SELECT avg_oos_sharpe, failures_json"
+                        " FROM wf_summary ORDER BY run_at DESC LIMIT 1"
+                    ).fetchone()
+                except _sqlite3.OperationalError:
+                    wf_row = None  # 테이블 미생성
+
+                if wf_row is None:
+                    failures.append("① Walk-Forward 결과 없음 (run_walk_forward.py 실행 필요)")
+                    failures.append("④ 하락장 낙폭 — Walk-Forward 미실행")
+                    failures.append("⑤ Lookahead Bias — Walk-Forward 미실행")
+                else:
+                    sharpe = float(wf_row["avg_oos_sharpe"] or 0.0)
+                    if sharpe < 1.5:
+                        failures.append(f"① OOS 샤프비율 {sharpe:.3f} < 1.5")
+
+                    wf_fails: list[str] = _json.loads(wf_row["failures_json"] or "[]")
+                    for f in wf_fails:
+                        if "하락장" in f:
+                            failures.append(f"④ {f}")
+                        elif "Lookahead" in f:
+                            failures.append(f"⑤ {f}")
+                        # 과적합 경고는 7가지 기준에 없으므로 생략
+
+                # ─── ②③: trades 테이블 직접 계산 ────────────────────
+                try:
+                    trade_rows = conn.execute(
+                        "SELECT pnl_pct FROM trades"
+                        " WHERE side='SELL' AND pnl_pct IS NOT NULL ORDER BY timestamp"
+                    ).fetchall()
+                except _sqlite3.OperationalError:
+                    trade_rows = []
+
+                if len(trade_rows) < 30:
+                    failures.append(
+                        f"② 최대낙폭 — SELL 체결 {len(trade_rows)}건 < 30건 (데이터 부족)"
+                    )
+                    failures.append(
+                        f"③ 승률 — SELL 체결 {len(trade_rows)}건 < 30건 (데이터 부족)"
+                    )
+                else:
+                    import numpy as _np
+                    pnls = _np.array([float(r["pnl_pct"]) for r in trade_rows])
+
+                    # ② 최대낙폭
+                    cum = _np.cumprod(1.0 + pnls)
+                    roll_max = _np.maximum.accumulate(cum)
+                    mdd = float(_np.min((cum - roll_max) / roll_max))
+                    if mdd < -0.20:
+                        failures.append(f"② 최대낙폭 {mdd:.1%} < -20%")
+
+                    # ③ 승률
+                    wr = float(_np.mean(pnls > 0))
+                    if wr < 0.55:
+                        failures.append(f"③ 승률 {wr:.1%} < 55%")
+
+                # ─── ⑥: Monte Carlo ────────────────────────────────
+                try:
+                    mc_row = conn.execute(
+                        "SELECT p_value, passed FROM backtest_results"
+                        " WHERE type='monte_carlo' ORDER BY run_at DESC LIMIT 1"
+                    ).fetchone()
+                except _sqlite3.OperationalError:
+                    mc_row = None
+
+                if mc_row is None:
+                    failures.append("⑥ Monte Carlo 결과 없음 (주간 백테스트 실행 필요)")
+                elif not mc_row["passed"]:
+                    failures.append(f"⑥ Monte Carlo p-value={mc_row['p_value']:.4f} >= 0.05")
+
+                # ─── ⑦: DRY_RUN 48시간 ─────────────────────────────
+                try:
+                    ts_row = conn.execute(
+                        "SELECT MIN(timestamp) as first_ts FROM trades WHERE is_dry_run=1"
+                    ).fetchone()
+                except _sqlite3.OperationalError:
+                    ts_row = None
+
+                if ts_row and ts_row["first_ts"]:
+                    try:
+                        ts_str: str = ts_row["first_ts"]
+                        # ISO 형식 정규화 (타임존 없으면 UTC 가정)
+                        if "+" not in ts_str and not ts_str.endswith("Z"):
+                            ts_str += "+00:00"
+                        first_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        elapsed_h = (
+                            datetime.now(timezone.utc) - first_ts
+                        ).total_seconds() / 3600
+                        if elapsed_h < 48:
+                            failures.append(
+                                f"⑦ DRY_RUN 운영 {elapsed_h:.1f}시간 < 48시간"
+                            )
+                    except (ValueError, TypeError) as exc:
+                        failures.append(f"⑦ DRY_RUN 시작 시각 파싱 불가: {exc}")
+                else:
+                    failures.append("⑦ DRY_RUN 거래 기록 없음")
+
+            finally:
+                conn.close()
+
+        except Exception as exc:
+            logger.error("[Engine] 체크리스트 조회 오류: %s", exc)
+            raise
+
+        return failures
+
     def _reset_daily_counter(self) -> None:
         """날짜 변경 시 일일 거래 횟수 리셋."""
         today = datetime.now(timezone.utc).date().isoformat()
         if self._state.last_trade_day != today:
             self._state.daily_trade_count = 0
             self._state.last_trade_day = today
+
+    async def _filter_by_quality(
+        self, market_states: list[MarketState]
+    ) -> list[MarketState]:
+        """DataQualityChecker score < 0.5 코인을 메인 루프에서 제외한다.
+
+        CandleBuilder가 미주입(None)이면 호출 자체를 하지 않으므로(Step 2.5 가드)
+        여기서는 항상 self._candle_builder가 유효하다고 가정한다.
+        validate_pipeline이 async이므로 await 처리한다.
+        """
+        passed: list[MarketState] = []
+        for ms in market_states:
+            df = self._candle_builder._build_df_with_indicators(ms.coin, "5m")
+            if df is None or df.empty:
+                # DataFrame 없으면 품질 검증 불가 — 통과 처리 (데이터 부족은 Layer1이 처리)
+                passed.append(ms)
+                continue
+            ws_price = ms.close_5m if ms.close_5m > 0 else None
+            _, score, _ = await self._quality_checker.validate_pipeline(
+                df, "5m", ms.coin, ws_price=ws_price
+            )
+            if score < 0.5:
+                logger.warning(
+                    "[Engine] %s 데이터 품질 score=%.3f < 0.5 — 해당 코인 루프 스킵",
+                    ms.coin, score,
+                )
+                continue
+            passed.append(ms)
+        return passed
 
     def _check_price_circuits(self, market_states: list[MarketState]) -> None:
         """각 코인의 현재가를 이력에 기록하고 가격 급락 서킷브레이커를 체크한다.

@@ -32,6 +32,10 @@ import signal
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from backtest.monte_carlo import MonteCarloResult
 
 # ─────────────────────────────────────────────────────────────────
 # 경로 설정: upbit_bot/ 을 패키지 루트로 등록
@@ -248,6 +252,8 @@ class BotApplication:
             initial_capital=cfg["initial_capital"],
             yaml_config=cfg.get("yaml", {}),
         )
+        # Phase 자동 전환 감지용 DB 경로 주입 (7가지 체크리스트 조회에 필요)
+        self._engine.set_db_path(str(cfg["db_path"]))
 
         # 레이어 컴포넌트
         self._decay_monitor = StrategyDecayMonitor()
@@ -295,6 +301,8 @@ class BotApplication:
             current_phase="Phase B" if self._cfg["phase_b"] else "Phase A",
         )
         self._telegram.set_context(ctx)
+        # 200건 달성 알림 콜백 주입 (set_context 이후 — bot이 준비된 상태에서 주입)
+        self._engine.set_telegram_callback(self._telegram.send)
 
     # ──────────────────────────────────────────────────────────────
     # APScheduler 초기화 및 스케줄 작업
@@ -375,7 +383,16 @@ class BotApplication:
             misfire_grace_time=300,
         )
 
-        logger.info("[main] APScheduler 6개 크론 작업 등록 완료 (coin_history는 독립 프로세스)")
+        # 매주 일요일 02:00 UTC — Walk-Forward 백테스트 + Monte Carlo 검증
+        self._scheduler.add_job(
+            self._job_weekly_backtest,
+            CronTrigger(day_of_week="sun", hour=2, minute=0),
+            id="weekly_backtest",
+            name="주간 Walk-Forward + Monte Carlo 백테스트",
+            misfire_grace_time=3600,
+        )
+
+        logger.info("[main] APScheduler 7개 크론 작업 등록 완료 (coin_history는 독립 프로세스)")
 
     async def _job_coin_history_snapshot(self) -> None:
         """매일 00:00 UTC — 업비트 KRW 마켓 코인 목록 스냅샷 저장."""
@@ -510,7 +527,7 @@ class BotApplication:
             if not grid_coins:
                 return
             if hasattr(self._engine, "_recalc_grid_ranges"):
-                market_states = self._collect_market_states()
+                market_states = await self._collect_market_states()
                 await self._engine._recalc_grid_ranges(grid_coins, market_states)
                 logger.info("[scheduler] 그리드 재계산 완료 (%d개)", len(grid_coins))
         except Exception as exc:
@@ -529,7 +546,7 @@ class BotApplication:
             if not dca_coins:
                 return
             if hasattr(self._engine, "_check_dca_safety_orders"):
-                market_states = self._collect_market_states()
+                market_states = await self._collect_market_states()
                 await self._engine._check_dca_safety_orders(dca_coins, market_states)
         except Exception as exc:
             logger.error("[scheduler] DCA Safety Order 오류: %s", exc)
@@ -543,6 +560,211 @@ class BotApplication:
                 logger.info("[scheduler] 페어리스트 갱신 완료")
         except Exception as exc:
             logger.error("[scheduler] 페어리스트 갱신 오류: %s", exc)
+
+    async def _job_weekly_backtest(self) -> None:
+        """매주 일요일 02:00 UTC — Walk-Forward 백테스트 + Monte Carlo 검증.
+
+        순서:
+          1. scripts/run_walk_forward.py subprocess 실행
+          2. trades 테이블에서 OOS pnl 시퀀스 로드
+          3. MonteCarloValidator.validate() 실행
+          4. backtest_results 테이블 저장
+          5. 결과 텔레그램 알림 (실패 시 priority=1 긴급)
+        """
+        logger.info("[scheduler] 주간 백테스트 시작")
+
+        script_path = _BOT_DIR / "scripts" / "run_walk_forward.py"
+        db_path     = str(self._cfg["db_path"])
+        output_dir  = _PROJECT_DIR / "results" / "walk_forward"
+        run_id      = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+        # ── 1. run_walk_forward.py subprocess ─────────────────────
+        wf_ok = False
+        try:
+            end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, str(script_path),
+                "--coins",      "BTC,ETH,XRP,SOL,ADA",
+                "--start",      "2022-01-01",
+                "--end",        end_date,
+                "--output-dir", str(output_dir),
+                "--db-path",    db_path,
+                "--no-telegram",    # 텔레그램 알림은 이 job에서 직접 전송
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=7200  # 최대 2시간
+            )
+            if proc.returncode == 0:
+                logger.info("[scheduler] Walk-Forward subprocess 완료")
+                wf_ok = True
+            else:
+                err_tail = (
+                    stderr_bytes.decode("utf-8", errors="replace")[-500:]
+                    if stderr_bytes else ""
+                )
+                logger.error(
+                    "[scheduler] Walk-Forward 실패 (rc=%d): %s",
+                    proc.returncode, err_tail,
+                )
+
+        except asyncio.TimeoutError:
+            logger.error("[scheduler] Walk-Forward 타임아웃 (2시간 초과)")
+            if self._telegram:
+                await self._telegram.send(
+                    "🚨 <b>Walk-Forward 타임아웃</b> — 2시간 초과\n수동 확인 필요",
+                    priority=1,
+                )
+            return
+
+        except Exception as exc:
+            logger.error("[scheduler] Walk-Forward subprocess 오류: %s", exc)
+            if self._telegram:
+                await self._telegram.send(
+                    f"🚨 <b>Walk-Forward subprocess 오류</b>\n{exc}",
+                    priority=1,
+                )
+            return
+
+        if not wf_ok:
+            if self._telegram:
+                await self._telegram.send(
+                    "🚨 <b>Walk-Forward 실패</b>\n"
+                    "데이터 부족 또는 Lookahead Bias 오염 감지\n"
+                    "logs/run_walk_forward.log 확인 필요",
+                    priority=1,
+                )
+            return
+
+        # ── 2~4. Monte Carlo 검증 + 저장 ──────────────────────────
+        try:
+            pnl_pcts = await asyncio.to_thread(self._load_oos_pnls, db_path)
+
+            from backtest.monte_carlo import MonteCarloValidator
+            validator  = MonteCarloValidator()
+            mc_result  = await asyncio.to_thread(validator.validate, pnl_pcts)
+
+            logger.info("[scheduler] %s", mc_result.summary())
+
+            await asyncio.to_thread(
+                self._save_backtest_results_sqlite,
+                mc_result, run_id, db_path,
+            )
+
+            # ── 5. 텔레그램 알림 ──────────────────────────────────
+            if self._telegram:
+                status = "✅ PASS" if mc_result.passed else "🚨 FAIL"
+                p_label = "< 0.05 ✓" if mc_result.passed else ">= 0.05 ✗"
+                msg = (
+                    f"<b>📊 주간 백테스트 완료</b> {status}\n"
+                    f"Monte Carlo p-value: {mc_result.p_value:.4f} ({p_label})\n"
+                    f"실제 샤프: {mc_result.actual_sharpe:.3f}\n"
+                    f"셔플 평균 샤프: {mc_result.shuffle_sharpe_mean:.3f}\n"
+                    f"엣지 신뢰도: {mc_result.edge_confidence:.1%}\n"
+                    f"MDD: {mc_result.actual_max_drawdown:.1%}\n"
+                    f"95% CI: [{mc_result.sharpe_ci_lower:.3f}, {mc_result.sharpe_ci_upper:.3f}]\n"
+                    f"거래 수: {mc_result.n_trades}건"
+                )
+                priority = 1 if not mc_result.passed else 2
+                await self._telegram.send(msg, priority=priority)
+
+            if not mc_result.passed:
+                logger.warning(
+                    "[scheduler] Monte Carlo FAIL — p-value=%.4f >= 0.05. 실전 전환 불가.",
+                    mc_result.p_value,
+                )
+
+        except Exception as exc:
+            logger.error("[scheduler] Monte Carlo 검증 오류: %s", exc)
+            if self._telegram:
+                await self._telegram.send(
+                    f"🚨 <b>Monte Carlo 검증 오류</b>\n{exc}",
+                    priority=1,
+                )
+
+    def _load_oos_pnls(self, db_path: str) -> list[float]:
+        """trades 테이블에서 실현 손익률 시퀀스 로드 (Monte Carlo 입력).
+
+        Phase B 이후: Walk-Forward OOS 구간 거래만 필터링하도록 교체 예정.
+        현재: 전체 SELL 체결 최근 500건 사용.
+
+        Returns:
+            pnl_pct 리스트 (빈 리스트 가능)
+        """
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT pnl_pct FROM trades"
+                " WHERE side='SELL' AND pnl_pct IS NOT NULL"
+                " ORDER BY timestamp DESC LIMIT 500"
+            ).fetchall()
+            return [float(row[0]) for row in rows]
+        finally:
+            conn.close()
+
+    def _save_backtest_results_sqlite(
+        self,
+        mc_result: MonteCarloResult,
+        run_id: str,
+        db_path: str,
+    ) -> None:
+        """Monte Carlo 결과를 backtest_results 테이블에 저장.
+
+        Args:
+            mc_result: MonteCarloResult 인스턴스
+            run_id:    실행 식별자 (YYYYMMDD_HHMMSS)
+            db_path:   SQLite 경로
+        """
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(db_path)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS backtest_results (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id          TEXT    NOT NULL,
+                    run_at          TEXT    NOT NULL,
+                    type            TEXT    NOT NULL,
+                    actual_sharpe   REAL,
+                    p_value         REAL,
+                    edge_confidence REAL,
+                    max_drawdown    REAL,
+                    final_return    REAL,
+                    n_trades        INTEGER,
+                    passed          INTEGER NOT NULL,
+                    summary_text    TEXT
+                )
+            """)
+            conn.execute(
+                """
+                INSERT INTO backtest_results
+                  (run_id, run_at, type,
+                   actual_sharpe, p_value, edge_confidence,
+                   max_drawdown, final_return, n_trades,
+                   passed, summary_text)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    run_id,
+                    datetime.now(timezone.utc).isoformat(),
+                    "monte_carlo",
+                    round(mc_result.actual_sharpe,    4),
+                    round(mc_result.p_value,          6),
+                    round(mc_result.edge_confidence,  4),
+                    round(mc_result.actual_max_drawdown, 4),
+                    round(mc_result.actual_final_return, 4),
+                    mc_result.n_trades,
+                    int(mc_result.passed),
+                    mc_result.summary(),
+                ),
+            )
+            conn.commit()
+            logger.info("[scheduler] backtest_results 저장 완료 run_id=%s", run_id)
+        finally:
+            conn.close()
 
     # ──────────────────────────────────────────────────────────────
     # DRY_RUN 콘솔 출력
@@ -579,7 +801,7 @@ class BotApplication:
         while not self._shutdown_event.is_set():
             try:
                 # CandleBuilder에서 활성 코인 MarketState 수집
-                market_states = self._collect_market_states()
+                market_states = await self._collect_market_states()
                 if market_states:
                     await self._engine.main_loop(market_states)
                 else:
@@ -601,7 +823,7 @@ class BotApplication:
         logger.info("[main] 포지션 모니터 루프 시작 (주기=%ds)", POSITION_LOOP_INTERVAL_SEC)
         while not self._shutdown_event.is_set():
             try:
-                market_states = self._collect_market_states()
+                market_states = await self._collect_market_states()
                 if market_states and hasattr(self._engine, "_position_loop"):
                     await self._engine._position_loop(market_states)
             except Exception as exc:
@@ -660,8 +882,11 @@ class BotApplication:
     # 헬퍼: MarketState 수집
     # ──────────────────────────────────────────────────────────────
 
-    def _collect_market_states(self):
-        """활성 페어리스트의 MarketState 수집."""
+    async def _collect_market_states(self):
+        """활성 페어리스트의 MarketState 수집.
+
+        get_market_state()가 async(run_in_executor 격리)이므로 이 메서드도 async.
+        """
         from schema import MarketState
         states = []
         if self._collector is None:
@@ -670,7 +895,7 @@ class BotApplication:
         try:
             pairs = self._collector.pairlist.get_active_pairs()
             for coin in pairs:
-                ms = self._collector.get_market_state(coin)
+                ms = await self._collector.get_market_state(coin)
                 if ms is not None:
                     states.append(ms)
         except Exception as exc:

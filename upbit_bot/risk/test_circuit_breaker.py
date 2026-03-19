@@ -345,3 +345,48 @@ class TestThreadSafety:
 
         # 3회 이상 → Level 4 발동 보장
         assert cb.level == 4
+
+
+# ---------------------------------------------------------------------------
+# is_sell_blocked() — Level 2 SELL 허용, Level 3+ SELL 차단
+# ---------------------------------------------------------------------------
+
+class TestIsSellBlocked:
+    def test_level0_sell_not_blocked(self):
+        cb = _cb()
+        assert cb.is_sell_blocked() is False
+
+    def test_level1_sell_not_blocked(self):
+        """Level 1은 매수 차단만, SELL 허용."""
+        cb = _cb()
+        cb.trigger(1, "테스트")
+        assert cb.is_sell_blocked() is False
+
+    def test_level2_sell_not_blocked(self):
+        """Level 2는 신규 진입 차단, SELL은 허용 — '전량 USDT 전환' 가능."""
+        cb = _cb()
+        cb.trigger(2, "테스트")
+        assert cb.is_sell_blocked() is False
+
+    def test_level3_sell_blocked(self):
+        """Level 3 이상은 당일 전체 중단, SELL도 차단."""
+        cb = _cb()
+        cb.trigger(3, "테스트")
+        assert cb.is_sell_blocked() is True
+
+    def test_level4_sell_blocked(self):
+        cb = _cb()
+        cb.trigger(4, "테스트")
+        assert cb.is_sell_blocked() is True
+
+    def test_level5_sell_blocked(self):
+        cb = _cb()
+        cb.trigger(5, "테스트")
+        assert cb.is_sell_blocked() is True
+
+    def test_level2_buy_blocked_sell_allowed(self):
+        """Level 2에서 매수 차단·SELL 허용 동시 확인."""
+        cb = _cb()
+        cb.trigger(2, "10분 -8%")
+        assert cb.is_buy_blocked() is True
+        assert cb.is_sell_blocked() is False

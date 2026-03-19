@@ -25,12 +25,14 @@ logger = logging.getLogger(__name__)
 # 레벨별 설정
 # ------------------------------------------------------------------
 
+# block_buy / block_sell 필드는 is_buy_blocked() / is_sell_blocked() 메서드로 이전됨.
+# 여기서는 쿨다운과 자동 회복 여부만 관리한다.
 _LEVEL_CONFIG = {
-    1: {"block_buy": True,  "block_sell": False, "cooldown_min": 5,   "auto_recover": True},
-    2: {"block_buy": True,  "block_sell": False, "cooldown_min": 30,  "auto_recover": True},
-    3: {"block_buy": True,  "block_sell": False, "cooldown_min": 1440,"auto_recover": True},
-    4: {"block_buy": True,  "block_sell": False, "cooldown_min": 60,  "auto_recover": True},
-    5: {"block_buy": True,  "block_sell": False, "cooldown_min": 99999,"auto_recover": False},
+    1: {"cooldown_min": 5,    "auto_recover": True},
+    2: {"cooldown_min": 30,   "auto_recover": True},
+    3: {"cooldown_min": 1440, "auto_recover": True},
+    4: {"cooldown_min": 60,   "auto_recover": True},
+    5: {"cooldown_min": 99999,"auto_recover": False},
 }
 
 
@@ -81,9 +83,24 @@ class CircuitBreaker:
             return self._level >= 1
 
     def is_all_blocked(self) -> bool:
-        """전체 거래 중단 여부 (Level 2~5)."""
+        """신규 진입 차단 여부 (Level 2~5).
+
+        decision_loop(신규 매수·매도 진입 판단)에서 사용.
+        포지션 청산(SELL) 여부는 is_sell_blocked()로 별도 판단할 것 —
+        Level 2는 신규 진입을 막되 청산 SELL은 허용해야 "전량 USDT 전환"이 가능하다.
+        """
         with self._lock:
             return self._level >= 2
+
+    def is_sell_blocked(self) -> bool:
+        """SELL(청산) 차단 여부 (Level 3~5).
+
+        position_loop(포지션 모니터링·청산)에서 사용.
+        Level 2는 신규 진입만 차단; SELL은 허용하여 "전량 USDT 전환"을 가능하게 한다.
+        Level 3 이상은 당일 전체 중단이므로 SELL도 차단.
+        """
+        with self._lock:
+            return self._level >= 3
 
     def is_manual_required(self) -> bool:
         """수동 확인 필요 (Level 5)."""
@@ -103,20 +120,29 @@ class CircuitBreaker:
     # 트리거 / 회복
     # ------------------------------------------------------------------
 
+    def _trigger_locked(self, level: int, reason: str) -> None:
+        """_lock 보유 상태에서만 호출하는 내부 트리거.
+
+        record_api_error() 등 이미 _lock 내부에 있는 코드에서 원자적으로
+        발동 결정과 상태 변경을 수행하기 위해 사용.
+        직접 외부 호출 금지 — 공개 API는 trigger() 사용.
+        """
+        if level > self._level:
+            self._level = level
+            self._triggered_at = datetime.now(timezone.utc)
+            self._reason = reason
+            event = TriggerEvent(level, reason, self._triggered_at)
+            self._history.append(event)
+            logger.warning(
+                "[서킷브레이커] Level %d 발동: %s", level, reason
+            )
+
     def trigger(self, level: int, reason: str) -> None:
         """서킷브레이커 발동 (기존보다 높은 레벨만 적용)."""
         if level < 1 or level > 5:
             raise ValueError(f"유효하지 않은 레벨: {level}")
         with self._lock:
-            if level > self._level:
-                self._level = level
-                self._triggered_at = datetime.now(timezone.utc)
-                self._reason = reason
-                event = TriggerEvent(level, reason, self._triggered_at)
-                self._history.append(event)
-                logger.warning(
-                    "[서킷브레이커] Level %d 발동: %s", level, reason
-                )
+            self._trigger_locked(level, reason)
 
     def maybe_recover(self) -> bool:
         """쿨다운 완료 시 자동 회복. True 반환 시 회복됨."""
@@ -153,12 +179,15 @@ class CircuitBreaker:
     # ------------------------------------------------------------------
 
     def record_api_error(self) -> None:
-        """API 오류 1회 기록. 3회 누적 시 Level 4 자동 발동."""
+        """API 오류 1회 기록. 3회 누적 시 Level 4 자동 발동.
+
+        카운트 확인과 Level 4 발동을 동일 lock 내에서 수행하여
+        clear_api_error()와의 레이스 컨디션을 제거한다.
+        """
         with self._lock:
             self._api_error_count += 1
-            count = self._api_error_count
-        if count >= 3:
-            self.trigger(4, f"API 오류 {count}회 연속")
+            if self._api_error_count >= 3:
+                self._trigger_locked(4, f"API 오류 {self._api_error_count}회 연속")
 
     def clear_api_error(self) -> None:
         """API 성공 시 카운터 초기화."""
@@ -212,9 +241,12 @@ class CircuitBreaker:
         return triggered
 
     def check_data_mismatch(self, deviation_pct: float) -> None:
-        """WebSocket vs REST 괴리 >3% → Level 4."""
-        if deviation_pct > 3.0:
-            self.trigger(4, f"WebSocket vs REST 괴리 {deviation_pct:.2f}% > 3%")
+        """WebSocket vs REST 괴리 절댓값 >3% → Level 4.
+
+        양방향(+/−) 모두 감지: WebSocket이 REST보다 높거나 낮아도 3% 초과 시 발동.
+        """
+        if abs(deviation_pct) > 3.0:
+            self.trigger(4, f"WebSocket vs REST 괴리 {deviation_pct:.2f}% (절댓값 > 3%)")
 
     def get_history(self, last_n: int = 10) -> list[TriggerEvent]:
         with self._lock:

@@ -113,6 +113,10 @@ class PairlistManager:
             return pairs
         except Exception as exc:
             logger.error("페어리스트 갱신 실패: %s", exc)
+            if not self._active_pairs:
+                # 첫 기동 시 이전 목록 없음 → 빈 목록 반환 시 WebSocket 구독 전무,
+                # 데이터 수집 전면 중단. 즉시 종료해야 한다.
+                raise RuntimeError(f"첫 기동 페어리스트 갱신 실패 — 봇을 시작할 수 없음: {exc}") from exc
             # 의도적 폴백: 갱신 실패 시 이전 목록 유지.
             # 빈 목록을 반환하면 WebSocket 구독이 취소되고 모든 데이터 수집이 멈추므로
             # 이전 페어리스트로 계속 운영하는 것이 안전하다.
@@ -249,6 +253,11 @@ class UpbitWebSocketCollector:
         self._pairs: list[str] = []
         self._running = False
         self._ws_task: asyncio.Task | None = None
+        self._cb: Any | None = None  # CircuitBreaker — set_circuit_breaker()로 후(後) 주입
+
+    def set_circuit_breaker(self, cb: Any) -> None:
+        """CircuitBreaker 후(後) 주입."""
+        self._cb = cb
 
     def set_pairs(self, pairs: list[str]) -> None:
         """페어리스트 갱신 시 호출 — 재연결 트리거."""
@@ -275,6 +284,8 @@ class UpbitWebSocketCollector:
                 break
             except Exception as exc:
                 logger.warning("WebSocket 연결 끊김: %s — %.1f초 후 재연결", exc, delay)
+                if self._cb is not None:
+                    self._cb.record_api_error()
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, WS_RECONNECT_MAX_DELAY)
 
@@ -340,6 +351,7 @@ class UpbitWebSocketCollector:
             )
         except Exception as exc:
             logger.warning("WebSocket 메시지 파싱 오류: %s", exc)
+            # 의도적 계속 진행: 단일 메시지 파싱 실패는 스트림 전체 중단 사유 아님
             return None
 
 
@@ -425,6 +437,11 @@ class KimchiPremiumCollector:
         self._usd_krw: float = usd_krw_initial  # BOK API 실패 시 fallback — config.yaml data.usd_krw_initial
         self._last_bok_date: str = ""
         self._latest_premium: float = 0.0
+        self._candle_builder: Any = None  # set_candle_builder()로 주입 — BTC 현재가 WebSocket 우선
+
+    def set_candle_builder(self, candle_builder: Any) -> None:
+        """CandleBuilder 주입 — BTC/KRW 현재가를 WebSocket 데이터에서 읽기 위해."""
+        self._candle_builder = candle_builder
 
     async def refresh_usd_krw(self, session: aiohttp.ClientSession) -> float:
         """한국은행 환율 (일 1회 캐시)."""
@@ -462,12 +479,21 @@ class KimchiPremiumCollector:
     async def collect(self, session: aiohttp.ClientSession) -> float:
         """5분 주기 김치프리미엄 계산 + SQLite 저장."""
         try:
-            # 업비트 BTC/KRW
-            upbit_tickers = pyupbit.get_current_price("KRW-BTC")
-            if not upbit_tickers:
+            # 업비트 BTC/KRW — WebSocket CandleBuilder 우선, 미수신 시 run_in_executor 격리
+            # pyupbit.get_current_price()는 requests 기반 동기 라이브러리 — 직접 호출 금지
+            upbit_krw_val: float | None = None
+            if self._candle_builder is not None:
+                upbit_krw_val = self._candle_builder.get_current_price("KRW-BTC")
+            if upbit_krw_val is None:
+                # WebSocket 데이터 미수신 또는 CandleBuilder 미주입 — 동기 호출을 스레드 풀로 격리
+                loop = asyncio.get_event_loop()
+                upbit_krw_val = await loop.run_in_executor(
+                    None, pyupbit.get_current_price, "KRW-BTC"
+                )
+            if not upbit_krw_val:
                 logger.warning("업비트 BTC/KRW 조회 실패 — 김치프리미엄 이전값 유지: %.2f%%", self._latest_premium)
                 return self._latest_premium
-            upbit_krw = float(upbit_tickers)
+            upbit_krw = float(upbit_krw_val)
 
             # 바이낸스 BTC/USDT
             async with session.get(
@@ -877,6 +903,7 @@ class UpbitDataCollector:
 
         from data.candle_builder import CandleBuilder
         self._candle_builder = CandleBuilder(cache=self._cache)
+        self._kimchi.set_candle_builder(self._candle_builder)
 
         self._rate_limiter = RateLimiter(max_per_second=8)
         self._session: aiohttp.ClientSession | None = None
@@ -886,6 +913,7 @@ class UpbitDataCollector:
     def set_circuit_breaker(self, cb: Any) -> None:
         """CircuitBreaker 후(後) 주입 — engine 초기화 후 main.py에서 호출."""
         self._cb = cb
+        self._ws_collector.set_circuit_breaker(cb)
 
     # ------------------------------------------------------------------
     # 초기화
@@ -939,7 +967,7 @@ class UpbitDataCollector:
 
                     # 인메모리 CandleBuilder에도 로드
                     for row in rows:
-                        self._candle_builder._candles_5m[coin].append(row)
+                        self._candle_builder.add_historical_candle(coin, row)
 
                 await asyncio.sleep(0.1)
             except Exception as exc:
@@ -1037,9 +1065,17 @@ class UpbitDataCollector:
     # MarketState 조회
     # ------------------------------------------------------------------
 
-    def get_market_state(self, coin: str) -> MarketState | None:
-        """최신 MarketState 반환 — 외부 피처(지수/감성/온체인/OBI)도 통합."""
-        ms = self._candle_builder.get_market_state_snapshot(coin)
+    async def get_market_state(self, coin: str) -> MarketState | None:
+        """최신 MarketState 반환 — 외부 피처(지수/감성/온체인/OBI)도 통합.
+
+        get_market_state_snapshot() 내부에서 pandas-ta 지표 계산(_build_df_with_indicators)이
+        실행되므로 run_in_executor로 격리해 이벤트 루프 블로킹을 방지한다.
+        candle_builder.get_market_state_snapshot()은 sync def 그대로 유지.
+        """
+        loop = asyncio.get_event_loop()
+        ms = await loop.run_in_executor(
+            None, self._candle_builder.get_market_state_snapshot, coin
+        )
         if ms is None:
             return None
 

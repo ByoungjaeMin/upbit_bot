@@ -151,10 +151,27 @@ class CandleBuilder:
         self._candles_1h: dict[str, deque[dict]] = defaultdict(
             lambda: deque(maxlen=MAX_CANDLES_IN_MEMORY)
         )
-        # 1시간봉 합산용 임시 5분봉 누적
-        self._pending_5m_for_1h: dict[str, list[dict]] = defaultdict(list)
+        # 1시간봉 합산용 임시 5분봉 누적 — 12개(=1시간) 초과분 자동 폐기
+        self._pending_5m_for_1h: dict[str, deque[dict]] = defaultdict(
+            lambda: deque(maxlen=12)
+        )
         # silent-drop 감지용 마지막 trade 시각
         self._last_trade_ts: dict[str, datetime] = {}
+        # 코인별 최신 일봉 피처 (shift(1) 적용) — daily_update() 호출 시 갱신
+        # get_market_state_snapshot()에서 읽어 MarketState에 포함
+        self._daily_features: dict[str, dict] = {}
+
+    # ------------------------------------------------------------------
+    # 공개 헬퍼 — 초기 히스토리 로딩
+    # ------------------------------------------------------------------
+
+    def add_historical_candle(self, coin: str, row: dict) -> None:
+        """REST 초기 히스토리 로딩 시 인메모리 캔들 deque에 추가.
+
+        collector._initial_history_load()가 private attribute를 직접 조작하지 않도록
+        이 메서드를 경유한다.
+        """
+        self._candles_5m[coin].append(row)
 
     # ------------------------------------------------------------------
     # 진입점: WebSocket trade 이벤트
@@ -220,8 +237,9 @@ class CandleBuilder:
         if self._cache:
             self._cache.upsert_candle("candles_5m", coin, candle)
 
-        # 지표 계산 후 콜백
-        df_5m = self._build_df_with_indicators(coin, "5m")
+        # 지표 계산 후 콜백 — pandas-ta CPU 작업을 스레드 풀로 격리 (이벤트 루프 블로킹 방지)
+        loop = asyncio.get_event_loop()
+        df_5m = await loop.run_in_executor(None, self._build_df_with_indicators, coin, "5m")
         if self._on_candle_5m and df_5m is not None:
             await self._on_candle_5m(coin, df_5m, micro)
 
@@ -237,8 +255,9 @@ class CandleBuilder:
 
     async def _finalize_1h_candle(self, coin: str) -> None:
         """12개 5분봉 → 1시간봉."""
-        five_m = self._pending_5m_for_1h[coin][:12]
-        self._pending_5m_for_1h[coin] = self._pending_5m_for_1h[coin][12:]
+        # deque(maxlen=12) 이므로 최대 12개 — 전체 스냅샷 후 초기화
+        five_m = list(self._pending_5m_for_1h[coin])
+        self._pending_5m_for_1h[coin].clear()
 
         h1: dict = {
             "coin": coin,
@@ -255,7 +274,9 @@ class CandleBuilder:
         if self._cache:
             self._cache.upsert_candle("candles_1h", coin, h1)
 
-        df_1h = self._build_df_with_indicators(coin, "1h")
+        # 1시간봉 지표 계산 — 동일하게 스레드 풀 격리
+        loop = asyncio.get_event_loop()
+        df_1h = await loop.run_in_executor(None, self._build_df_with_indicators, coin, "1h")
         if self._on_candle_1h and df_1h is not None:
             await self._on_candle_1h(coin, df_1h)
 
@@ -333,6 +354,18 @@ class CandleBuilder:
                 }
                 self._cache.upsert_candle("candles_1d", coin, candle_row)
 
+        # 인메모리 캐시 갱신 — get_market_state_snapshot()이 일봉 피처를 읽기 위해.
+        # shift(1) 결과의 마지막 non-NaN 행 사용 (첫 행만 NaN이고 나머지는 유효).
+        valid = df_shifted[shift_cols].dropna()
+        if not valid.empty:
+            last = valid.iloc[-1]
+            self._daily_features[coin] = {
+                "ema50_1d":          float(last.get("ema50", 0) or 0),
+                "ema200_1d":         float(last.get("ema200", 0) or 0),
+                "rsi_1d":            float(last.get("rsi", 50) or 50),
+                "trend_encoding_1d": int(last.get("trend_encoding", 0) or 0),
+            }
+
         return df_shifted
 
     # ------------------------------------------------------------------
@@ -356,6 +389,9 @@ class CandleBuilder:
             val = latest.get(col, default)
             return float(val) if val is not None and not (isinstance(val, float) and np.isnan(val)) else default
 
+        # daily_update() shift(1) 결과 — 없으면 기본값 (daily_update 아직 미실행)
+        daily = self._daily_features.get(coin, {})
+
         return MarketState(
             coin=coin,
             timestamp=now,
@@ -378,6 +414,11 @@ class CandleBuilder:
             atr_5m=_f("atr"),
             tick_imbalance=bucket.tick_imbalance(),
             trade_velocity=bucket.trade_velocity(now),
+            # 일봉 피처 (shift(1) 적용 완료) — Lookahead Bias 없음
+            ema50_1d=daily.get("ema50_1d", 0.0),
+            ema200_1d=daily.get("ema200_1d", 0.0),
+            rsi_1d=daily.get("rsi_1d", 50.0),
+            trend_encoding_1d=daily.get("trend_encoding_1d", 0),
         )
 
     # ------------------------------------------------------------------

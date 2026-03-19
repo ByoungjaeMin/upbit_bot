@@ -2,6 +2,7 @@
 test_quality.py — DataQualityChecker 7단계 단위 테스트
 """
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -140,7 +141,7 @@ class TestStep5:
     def test_marks_anomaly_column(self, checker):
         df = _make_df(100)
         report = QualityReport(coin="KRW-BTC", interval="5m")
-        df_out, report = checker.step5_anomaly_detection(df, report)
+        df_out, report = asyncio.run(checker.step5_anomaly_detection(df, report))
         assert "is_anomaly" in df_out.columns
         assert "exclude_from_training" in df_out.columns
         assert 0.0 <= report.anomaly_pct <= 1.0
@@ -148,7 +149,7 @@ class TestStep5:
     def test_skips_small_df(self, checker):
         df = _make_df(10)
         report = QualityReport(coin="KRW-BTC", interval="5m")
-        df_out, report = checker.step5_anomaly_detection(df, report)
+        df_out, report = asyncio.run(checker.step5_anomaly_detection(df, report))
         assert "is_anomaly" not in df_out.columns
         assert report.anomaly_count == 0
 
@@ -210,13 +211,13 @@ class TestStep7:
 class TestPipeline:
     def test_clean_data_high_score(self, checker):
         df = _make_df(100)
-        df_out, score, report = checker.validate_pipeline(df, "5m", "KRW-BTC")
+        df_out, score, report = asyncio.run(checker.validate_pipeline(df, "5m", "KRW-BTC"))
         assert score >= 0.9
         assert report.status == "NORMAL"
 
     def test_stale_data_low_score(self, checker):
         df = _make_df(100, stale=True)
-        df_out, score, report = checker.validate_pipeline(df, "5m", "KRW-BTC")
+        df_out, score, report = asyncio.run(checker.validate_pipeline(df, "5m", "KRW-BTC"))
         assert score < 0.9
         assert report.stale_data is True
 
@@ -228,7 +229,7 @@ class TestPipeline:
 
     def test_training_mask(self, checker):
         df = _make_df(100)
-        _, _, _ = checker.validate_pipeline(df, "5m", "KRW-BTC")
+        _, _, _ = asyncio.run(checker.validate_pipeline(df, "5m", "KRW-BTC"))
         mask = checker.get_training_mask(df)
         assert len(mask) == len(df)
         assert mask.dtype == bool

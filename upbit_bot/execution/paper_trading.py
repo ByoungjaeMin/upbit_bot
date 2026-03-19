@@ -157,6 +157,61 @@ class PaperPortfolio:
         }
 
 
+def _insert_paper_trades(
+    metrics: "ComparisonMetrics",
+    db_path: str,
+    coin: str,
+    strategy: str,
+) -> None:
+    """ComparisonMetrics를 paper_trades 테이블에 INSERT.
+
+    Args:
+        metrics:  계산된 비교 지표
+        db_path:  SQLite DB 경로
+        coin:     코인 식별자 (집계 시 "ALL")
+        strategy: 전략 식별자 (집계 시 "ALL")
+
+    Raises:
+        sqlite3.Error: DB 연결·INSERT 실패 시 즉시 전파 (예외 삼키지 않음)
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_trades (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin              TEXT    NOT NULL,
+                strategy          TEXT    NOT NULL,
+                signal_match_rate REAL    NOT NULL,
+                price_deviation   REAL    NOT NULL,
+                timing_slippage   REAL    NOT NULL,
+                timestamp         TEXT    NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO paper_trades
+                (coin, strategy, signal_match_rate, price_deviation,
+                 timing_slippage, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                coin,
+                strategy,
+                metrics.signal_match_rate,
+                metrics.avg_price_deviation_pct,
+                metrics.avg_timing_slippage_sec,
+                metrics.computed_at.isoformat(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 class PaperTradingRunner:
     """페이퍼 트레이딩 병렬 실행 + 정량 비교 지표 관리.
 
@@ -228,7 +283,12 @@ class PaperTradingRunner:
             # 실거래 진입 없음: loop_id만 추적 (분모에 포함)
             pass
 
-    def compute_metrics(self) -> ComparisonMetrics:
+    def compute_metrics(
+        self,
+        db_path: str | None = None,
+        coin: str = "ALL",
+        strategy: str = "ALL",
+    ) -> ComparisonMetrics:
         """최근 HISTORY_WINDOW 루프 기준 비교 지표 계산."""
         # ① 신호 일치율
         total_loops = len(self._recent_loops)
@@ -277,6 +337,16 @@ class PaperTradingRunner:
                 "[PaperTrading] 타이밍 슬리피지 과다: %.1f초 (기준 %.0f초)",
                 avg_timing, TIMING_SLIPPAGE_ALERT_SEC,
             )
+
+        # DB 저장 — DB 저장 실패가 트레이딩 중단 사유 아님 (의도적 fallback).
+        # _insert_paper_trades 내부는 예외를 삼키지 않으므로 여기서 처리.
+        if db_path:
+            try:
+                _insert_paper_trades(metrics, db_path, coin, strategy)
+            except Exception as exc:
+                logger.error(
+                    "[PaperTrading] paper_trades DB 저장 실패 (트레이딩 계속): %s", exc
+                )
 
         return metrics
 

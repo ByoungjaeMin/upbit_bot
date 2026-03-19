@@ -201,19 +201,41 @@ class TestOneHourSynthesis:
 
 class TestDailyUpdate:
     def test_first_row_ema50_is_nan(self):
-        """shift(1) 적용 시 첫 행의 ema50은 NaN이어야 함."""
+        """shift(1) 적용 시 첫 행의 ema50은 NaN이어야 함.
+
+        n=60 으로 EMA50 계산이 실제로 가능한 데이터를 사용한다.
+        - 케이스 A (shift 적용): idx=49 는 NaN (원본의 첫 유효값이 idx=50으로 밀림)
+        - 케이스 B (미적용 기준): 원본 EMA50 idx=49 는 실제값 (NaN 아님)
+        → 두 케이스 대조로 shift(1)이 실제로 동작함을 검증한다.
+        """
         import numpy as np
+        import pandas_ta as ta_
+
         builder = CandleBuilder()
-        idx = pd.date_range("2026-01-01", periods=10, freq="D", tz="UTC")
+        n = 60
+        idx = pd.date_range("2026-01-01", periods=n, freq="D", tz="UTC")
+        close_vals = np.linspace(100.0, 200.0, n)
         df = pd.DataFrame({
-            "open": [100.0] * 10,
-            "high": [105.0] * 10,
-            "low": [95.0] * 10,
-            "close": [102.0] * 10,
-            "volume": [1000.0] * 10,
+            "open": close_vals - 1,
+            "high": close_vals + 2,
+            "low": close_vals - 2,
+            "close": close_vals,
+            "volume": [1000.0] * n,
         }, index=idx)
         df_shifted = builder.daily_update("KRW-BTC", df)
+
+        # 케이스 A: shift(1) 적용 — 첫 행은 NaN
         assert pd.isna(df_shifted["ema50"].iloc[0])
+
+        # 케이스 A: idx=49 도 NaN — 원본 첫 유효값(idx=49)이 idx=50으로 밀렸음
+        assert pd.isna(df_shifted["ema50"].iloc[49])
+
+        # 케이스 B: 원본(미적용) EMA50 idx=49 는 NaN이 아님 — shift가 실제로 뭔가를 옮겼음을 확인
+        orig_ema = ta_.ema(pd.Series(close_vals, index=idx), length=50)
+        assert not pd.isna(orig_ema.iloc[49])
+
+        # 케이스 A: idx=50 에는 원본 idx=49 값이 들어있어야 함 (shift(1) 효과)
+        assert not pd.isna(df_shifted["ema50"].iloc[50])
 
     def test_shifted_ema_lags_by_one(self):
         """ema50[i] (shifted) == ema50[i-1] (원본) — 데이터 충분 구간 검증."""

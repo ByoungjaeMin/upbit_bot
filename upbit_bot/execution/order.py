@@ -252,8 +252,7 @@ class UpbitClient:
         try:
             return float(self._upbit.get_balance(currency) or 0.0)
         except Exception as exc:
-            logger.error("[UpbitClient] 잔고 조회 실패: %s", exc)
-            return 0.0
+            raise UpbitAPIError(500, f"잔고 조회 실패: {exc}") from exc
 
 
 # ------------------------------------------------------------------
@@ -292,8 +291,7 @@ class PartialFillHandler:
             info = await self._client.get_order(order_id)
         except UpbitAPIError as exc:
             logger.error("[PartialFill] get_order 실패: %s", exc)
-            return self._make_status(order_id, coin, side, requested_krw,
-                                     limit_price, OrderResult.FAILED)
+            raise
 
         executed_vol = float(info.get("executed_volume", 0))
         remaining_vol = float(info.get("remaining_volume", 0))
@@ -331,7 +329,8 @@ class PartialFillHandler:
                     )
                     logger.info("[PartialFill] 미체결 잔량 시장가 Sweep %.6f", remaining_vol)
                 except UpbitAPIError as exc:
-                    logger.error("[PartialFill] Sweep 실패: %s", exc)
+                    # 미체결 잔량 방치는 Kelly 포지션 사이징 오염 — 즉시 전파
+                    raise
 
             status = self._make_status(order_id, coin, side, requested_krw,
                                        avg_price, OrderResult.PARTIALLY_FILLED)
@@ -437,7 +436,7 @@ class SmartOrderRouter:
         ob = await self._client.get_orderbook(req.coin)
         use_limit = self._should_use_limit(ob, req.krw_amount, trade_velocity)
 
-        if use_limit or req.force_market is False and use_limit:
+        if not req.force_market and use_limit:
             return await self._limit_order(req, ob)
         else:
             return await self._market_order(req)
@@ -524,7 +523,7 @@ class SmartOrderRouter:
                 logger.warning("[SmartOrderRouter] 지정가 시도 %d 실패: %s", attempt, exc)
                 if attempt == MAX_ORDER_RETRY:
                     raise
-                await asyncio.sleep(1)
+                await asyncio.sleep(2 ** (attempt - 1))  # 1s, 2s 지수 backoff
 
         # 부분 체결 처리
         return await self._partial_fill_handler.handle(
@@ -545,7 +544,11 @@ class SmartOrderRouter:
                         req.coin, "BUY", krw_amount=req.krw_amount
                     )
                 else:
-                    volume = req.krw_amount / req.current_price if req.current_price > 0 else 0
+                    if req.current_price <= 0:
+                        raise ValueError(
+                            f"current_price가 0 이하: {req.current_price} — SELL 수량 계산 불가"
+                        )
+                    volume = req.krw_amount / req.current_price
                     order_id = await self._client.place_market_order(
                         req.coin, "SELL", volume=volume
                     )
@@ -558,7 +561,7 @@ class SmartOrderRouter:
                 logger.warning("[SmartOrderRouter] 시장가 시도 %d 실패: %s", attempt, exc)
                 if attempt == MAX_ORDER_RETRY:
                     raise
-                await asyncio.sleep(1)
+                await asyncio.sleep(2 ** (attempt - 1))  # 1s, 2s 지수 backoff
 
         # 체결 정보 조회
         try:
@@ -624,5 +627,4 @@ class SmartOrderRouter:
             if exc.code == 400 and "already done" in exc.message:
                 logger.info("[SmartOrderRouter] 취소 레이스 → FULLY_FILLED: %s", order_id)
                 return OrderResult.FULLY_FILLED
-            logger.error("[SmartOrderRouter] cancel 실패: %s", exc)
-            return OrderResult.FAILED
+            raise
