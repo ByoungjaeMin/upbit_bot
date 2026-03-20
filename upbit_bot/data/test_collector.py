@@ -230,8 +230,11 @@ class TestUpbitDataCollectorCircuitBreaker:
         col.set_circuit_breaker(mock_cb)
         assert col._cb is mock_cb
 
-    def test_process_ws_queue_calls_cb_on_error(self):
-        """on_trade() 예외 발생 시 CB.record_api_error() 호출 확인."""
+    def test_process_ws_queue_no_cb_on_trade_error(self):
+        """on_trade() 파싱 예외 시 record_api_error() 호출하지 않음 확인.
+
+        trade 메시지 파싱 실패는 API 오류가 아니므로 CB를 건드리지 않는다.
+        """
         col = self._make_collector()
         mock_cb = MagicMock()
         col.set_circuit_breaker(mock_cb)
@@ -241,12 +244,9 @@ class TestUpbitDataCollectorCircuitBreaker:
         col._candle_builder.on_trade = AsyncMock(side_effect=RuntimeError("테스트 오류"))
 
         async def _run():
-            # 큐에 메시지 1개 넣고 루프를 취소
-            from schema import RawMarketData
             msg = MagicMock()
             await col._ws_queue.put(msg)
             task = asyncio.create_task(col.process_ws_queue())
-            # 큐 소비 대기 후 취소
             await asyncio.sleep(0.05)
             task.cancel()
             try:
@@ -255,7 +255,7 @@ class TestUpbitDataCollectorCircuitBreaker:
                 pass
 
         asyncio.run(_run())
-        mock_cb.record_api_error.assert_called_once()
+        mock_cb.record_api_error.assert_not_called()
 
     def test_process_ws_queue_continues_after_error(self):
         """예외 발생 후 루프가 계속 실행됨을 확인."""

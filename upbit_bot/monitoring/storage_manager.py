@@ -73,6 +73,7 @@ class StorageManager:
         )
         self._lock = threading.Lock()
         self._telegram_cb: Callable[[str], Any] | None = None
+        self._engine: Any = None
 
     # ──────────────────────────────────────────────────────────────
     # 텔레그램 알림 콜백
@@ -81,6 +82,10 @@ class StorageManager:
     def set_telegram_callback(self, cb: Callable[[str], Any]) -> None:
         """텔레그램 send 함수(또는 asyncio coroutine 함수) 등록."""
         self._telegram_cb = cb
+
+    def set_engine(self, engine: Any) -> None:
+        """VACUUM 중 trading pause/resume 대상 엔진 등록."""
+        self._engine = engine
 
     def _notify(self, message: str) -> None:
         """텔레그램 알림 전송. coroutine이면 새 이벤트 루프에서 실행."""
@@ -186,14 +191,23 @@ class StorageManager:
         size_before = self._db_size_mb()
         logger.info("[StorageManager] VACUUM 시작 (전: %.1f MB)", size_before)
 
-        # VACUUM은 WAL 체크포인트 후 단독 연결 필요
-        with self._lock:
-            conn = sqlite3.connect(str(self._db_path), isolation_level=None)
-            try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                conn.execute("VACUUM")
-            finally:
-                conn.close()
+        engine = self._engine
+        if engine is None:
+            logger.warning("[StorageManager] vacuum_database: engine 미연결 — 트레이딩 중단 없이 VACUUM 진행")
+        else:
+            engine.pause_trading()
+        try:
+            # VACUUM은 WAL 체크포인트 후 단독 연결 필요
+            with self._lock:
+                conn = sqlite3.connect(str(self._db_path), isolation_level=None)
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    conn.execute("VACUUM")
+                finally:
+                    conn.close()
+        finally:
+            if engine is not None:
+                engine.resume_trading()
 
         size_after = self._db_size_mb()
         freed = size_before - size_after

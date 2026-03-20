@@ -31,6 +31,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from risk.circuit_breaker import CircuitBreaker
+from risk.kelly import KellySizer, MIN_POSITION_KRW
+from risk.trailing_stop import TrailingStopManager
 from data.quality import DataQualityChecker
 from schema import (
     EnsemblePrediction,
@@ -112,8 +114,11 @@ class EngineState:
     last_trade_day: str = ""
     # 재진입 쿨타임 (coin → 쿨타임 만료 시각)
     reentry_cooldown: dict[str, datetime] = field(default_factory=dict)
-    # 손절 이력 (coin → 손절 시각)
-    stop_loss_history: dict[str, datetime] = field(default_factory=dict)
+    # 손절 이력 (coin → {'ts': datetime, 'supertrend_dir': int})
+    # supertrend_dir: 손절 당시 SuperTrend 방향 (+1/-1) — 재진입 조건 ② 비교용
+    stop_loss_history: dict[str, dict] = field(default_factory=dict)
+    # 재진입 1시간 추가 대기 (coin → 대기 만료 시각)
+    reentry_extended_wait: dict[str, datetime] = field(default_factory=dict)
 
 
 # ------------------------------------------------------------------
@@ -173,6 +178,10 @@ class TradingEngine:
         self._client = upbit_client or UpbitClient(dry_run=dry_run)
         self._router = SmartOrderRouter(self._client)
 
+        # 포지션 사이징 + 트레일링 스탑
+        self._kelly = KellySizer(total_capital=initial_capital)
+        self._trailing = TrailingStopManager()
+
         # 상태
         self._state = EngineState()
         self._positions: dict[str, Position] = {}
@@ -186,12 +195,13 @@ class TradingEngine:
         self._paper = PaperTradingRunner(initial_capital)
 
         # 이벤트 큐 (텔레그램 비동기 전송용)
-        self._telegram_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._telegram_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=100)
 
         # Phase 자동 전환 감지 (DRY_RUN → 실거래 검토 알림)
         self._telegram_cb: Any = None          # main.py에서 set_telegram_callback()으로 주입
         self._cold_start_notified: bool = False  # 200건 달성 알림 1회 방지
         self._db_path: str | None = None       # main.py에서 set_db_path()로 주입
+        self._trading_paused: bool = False     # VACUUM 등 DB 단독 연결 구간 중 신규 진입 차단
 
         # 가격 이력 (서킷브레이커 가격 급락 감지용, 코인당 최대 12개 = 1시간)
         self._price_history: dict[str, deque[tuple[datetime, float]]] = {}
@@ -239,6 +249,10 @@ class TradingEngine:
         """
         decisions: list[TradeDecision] = []
         self._reset_daily_counter()
+
+        if self._trading_paused:
+            logger.info("[Engine] main_loop: trading paused (VACUUM 등 DB 단독 연결 중) — 스킵")
+            return decisions
 
         # Step 1: 가격 급락 서킷브레이커 체크 — 레벨 에스컬레이션(1→2→3) 감지를 위해
         #         매수 차단 판단보다 반드시 먼저 실행해야 함.
@@ -315,23 +329,28 @@ class TradingEngine:
                 continue
             ms = ms_map.get(coin)
 
-            # ATR 트레일링 스탑 업데이트
-            if ms:
-                self._update_trailing_stop(pos, ms)
+            # ATR 트레일링 스탑 업데이트 — TrailingStopManager.update() triggered 직접 캡처
+            trailing_triggered = self._update_trailing_stop(pos, ms) if ms else False
 
             # 하드 손절
             if pos.pnl_pct(current) <= self._hard_stop_loss_pct:
-                await self._close_position(coin, current, reason="hard_stop", emergency=True)
+                await self._close_position(
+                    coin, current, reason="hard_stop", emergency=True,
+                    supertrend_dir=ms.supertrend_dir if ms else 0,
+                )
                 continue
 
-            # 트레일링 스탑
-            if pos.trailing_stop_price > 0 and current <= pos.trailing_stop_price:
-                await self._close_position(coin, current, reason="trailing_stop", emergency=True)
+            # 트레일링 스탑 (TrailingStopManager.update() 반환 triggered 사용)
+            if trailing_triggered:
+                await self._close_position(
+                    coin, current, reason="trailing_stop", emergency=True,
+                    supertrend_dir=ms.supertrend_dir if ms else 0,
+                )
                 continue
 
             # SuperTrend 반전 → 즉시 청산
             if ms and ms.supertrend_signal == -1 and pos.strategy_type.startswith("TREND"):
-                await self._close_position(coin, current, reason="supertrend_reversal")
+                await self._close_position(coin, current, reason="supertrend_reversal", emergency=True)
                 continue
 
             # 부분 익절
@@ -427,6 +446,13 @@ class TradingEngine:
                 logger.info("[Engine] %s VaR %.3f > %.0f%% — 포지션 50%% 축소", coin, rb.var_95, self._var_max_pct * 100)
                 if rb.var_adjusted_f <= 0:
                     continue
+                # 재판단: 50% 축소 후에도 VaR 초과 시 완전 스킵
+                if rb.var_95 > self._var_max_pct:
+                    logger.info(
+                        "[Engine] %s VaR %.3f 50%% 축소 후에도 %.0f%% 초과 — 스킵",
+                        coin, rb.var_95, self._var_max_pct * 100,
+                    )
+                    continue
 
             # ⑤ 마이크로스트럭처 최소 확인
             if ms.tick_imbalance < self._tick_imbalance_min and ms.obi < self._obi_min:
@@ -435,7 +461,7 @@ class TradingEngine:
 
             # ⑥ 동시 보유 포지션 < max
             if len(self._positions) >= self._max_positions:
-                break
+                continue
 
             # 재진입 쿨타임 확인
             if self._is_in_cooldown(coin):
@@ -444,8 +470,16 @@ class TradingEngine:
 
             # 손절 후 재진입 추가 조건 확인
             if coin in self._state.stop_loss_history:
+                # 1시간 추가 대기 중인지 먼저 확인
+                if self._is_in_extended_wait(coin):
+                    logger.debug("[Engine] %s 재진입 1시간 추가 대기 중 스킵", coin)
+                    continue
                 if not self._check_reentry_conditions(ms):
-                    logger.info("[Engine] %s 재진입 조건 미충족 — 추가 대기", coin)
+                    # 조건 미충족 → 1시간 추가 대기 타임스탬프 기록
+                    self._state.reentry_extended_wait[coin] = (
+                        datetime.now(timezone.utc) + timedelta(hours=1)
+                    )
+                    logger.info("[Engine] %s 재진입 조건 미충족 — 1시간 추가 대기", coin)
                     continue
 
             score = ep.weighted_avg * rb.var_adjusted_f
@@ -459,16 +493,20 @@ class TradingEngine:
         """손절 후 재진입 추가 3조건 (2개 이상 충족 필요).
 
         ① tick_imbalance > 0.15 (매수 체결 우세 회복)
-        ② RSI 40~65 (과열/과매도 아닌 구간)
+        ② SuperTrend 방향이 손절 당시와 반대로 전환 (손절 이력의 supertrend_dir 참조)
         ③ OBI > 0.10 (오더북 매수 우위 최소 확인)
         """
+        stored = self._state.stop_loss_history.get(ms.coin, {})
+        stored_dir = stored.get("supertrend_dir", 0)
+        # ②: 손절 당시 방향과 현재 방향이 반전됐고, 현재 방향이 유효(≠0)해야 충족
+        supertrend_reversed = (ms.supertrend_dir != 0 and ms.supertrend_dir != stored_dir)
         conds = [
             ms.tick_imbalance > self._reentry_tick_min,
-            self._reentry_rsi_min <= ms.rsi_5m <= self._reentry_rsi_max,
+            supertrend_reversed,
             ms.obi > self._reentry_obi_min,
         ]
         met = sum(conds)
-        logger.debug("[Engine] 재진입 조건 %d/3", met)
+        logger.debug("[Engine] 재진입 조건 %d/3 (supertrend_dir: 저장=%d 현재=%d)", met, stored_dir, ms.supertrend_dir)
         return met >= REENTRY_CONDITIONS_MIN
 
     # ------------------------------------------------------------------
@@ -495,13 +533,13 @@ class TradingEngine:
         position_size = rb.final_position_size
         is_dry = self._dry_run
 
-        # TREND: 0~90초 랜덤 지연 (front-running 방어)
+        # TREND/GRID/DCA: 0~90초 랜덤 지연 (front-running 방어)
+        # DRY_RUN 포함 항상 적용 — 실거래와 동작 일치 필요
         delay_sec = 0.0
-        if strategy.startswith("TREND"):
+        if strategy != "HOLD":
             delay_sec = random.uniform(0, self._entry_delay_max_sec)
-            if not is_dry:
-                logger.info("[Engine] 진입 지연 %.1f초 (front-running 방어)", delay_sec)
-                await asyncio.sleep(delay_sec)
+            logger.info("[Engine] 진입 지연 %.1f초 (front-running 방어) strategy=%s dry=%s", delay_sec, strategy, is_dry)
+            await asyncio.sleep(delay_sec)
 
         loop_id = str(uuid.uuid4())
         signal_ts = datetime.now(timezone.utc)
@@ -534,7 +572,7 @@ class TradingEngine:
         except Exception as exc:
             logger.error("[Engine] 주문 실패 %s: %s", ms.coin, exc)
             self._cb.record_api_error()
-            return None
+            raise
 
         # 체결 완료 시각 기록 (페이퍼 비교)
         executed_ts = datetime.now(timezone.utc)
@@ -550,6 +588,9 @@ class TradingEngine:
                 strategy_type=strategy,
             )
             self._positions[ms.coin] = pos
+            # 트레일링 스탑 초기화 (레짐별 ATR 멀티플라이어 적용)
+            init_stop = self._trailing.init(ms.coin, status.price, ms.atr_5m, strategy)
+            pos.trailing_stop_price = init_stop
             self._state.trade_count += 1
             self._state.daily_trade_count += 1
             # trade_count가 COLD_START_THRESHOLD(200)에 도달 시 실거래 전환 검토 알림
@@ -579,6 +620,7 @@ class TradingEngine:
         reason: str = "",
         emergency: bool = False,
         partial_ratio: float | None = None,
+        supertrend_dir: int = 0,
     ) -> bool:
         """포지션 청산.
 
@@ -627,15 +669,46 @@ class TradingEngine:
         # 포지션 제거
         if partial_ratio is None or (partial_ratio and qty >= pos.qty):
             del self._positions[coin]
+            self._trailing.remove(coin)
         else:
             pos.qty -= qty
 
         # 손절 이력 기록 (재진입 조건 강화용)
         if reason in ("hard_stop", "trailing_stop"):
-            self._state.stop_loss_history[coin] = datetime.now(timezone.utc)
+            self._state.stop_loss_history[coin] = {
+                "ts": datetime.now(timezone.utc),
+                "supertrend_dir": supertrend_dir,  # 재진입 조건 ② 비교용
+            }
             self._set_cooldown(coin)
 
         return True
+
+    async def emergency_liquidate_all(self) -> dict[str, bool]:
+        """긴급 전량매도 — 보유 포지션 전체 즉시 시장가 청산.
+
+        Returns:
+            {coin: 청산성공여부} — 포지션 없으면 빈 dict
+        """
+        coins = list(self._positions.keys())
+        if not coins:
+            logger.warning("[Engine] emergency_liquidate_all: 보유 포지션 없음")
+            return {}
+
+        logger.warning("[Engine] 긴급 전량매도 시작 — %d개 포지션", len(coins))
+        results: dict[str, bool] = {}
+        for coin in coins:
+            pos = self._positions.get(coin)
+            if pos is None:
+                continue
+            # 현재가 미확보 시 진입가 기준 사용 (emergency=True이므로 실제 체결은 시장가)
+            ok = await self._close_position(
+                coin, pos.entry_price, reason="emergency", emergency=True
+            )
+            results[coin] = ok
+            logger.warning("[Engine] 긴급 청산 %s: %s", coin, "완료" if ok else "실패")
+
+        logger.warning("[Engine] 긴급 전량매도 완료: %s", results)
+        return results
 
     async def _normal_close(self, req: OrderRequest) -> Any:
         """일반 청산: 지정가 우선 → 10초 미체결 시 시장가 전환."""
@@ -681,13 +754,20 @@ class TradingEngine:
     # 보조 기능
     # ------------------------------------------------------------------
 
-    def _update_trailing_stop(self, pos: Position, ms: MarketState) -> None:
-        """ATR 기반 트레일링 스탑 업데이트."""
+    def _update_trailing_stop(self, pos: Position, ms: MarketState) -> bool:
+        """TrailingStopManager에 위임. 레짐별 ATR 멀티플라이어 자동 적용.
+
+        Returns:
+            True — 스탑 발동 (position_loop에서 즉시 청산 필요)
+            False — 정상 유지
+        """
         if ms.atr_5m <= 0:
-            return
-        atr_stop = ms.close_5m - ms.atr_5m * 2.0
-        if atr_stop > pos.trailing_stop_price:
-            pos.trailing_stop_price = atr_stop
+            return False
+        triggered = self._trailing.update(pos.coin, ms.close_5m, ms.atr_5m)
+        stop = self._trailing.get_stop(pos.coin)
+        if stop is not None:
+            pos.trailing_stop_price = stop
+        return triggered
 
     async def _check_partial_tp(self, pos: Position, current_price: float) -> None:
         """부분 익절 조건 체크 (+10%, +20%)."""
@@ -1038,6 +1118,13 @@ class TradingEngine:
             datetime.now(timezone.utc) + timedelta(minutes=self._reentry_cooldown)
         )
 
+    def _is_in_extended_wait(self, coin: str) -> bool:
+        """재진입 1시간 추가 대기 중 여부 확인."""
+        wait_until = self._state.reentry_extended_wait.get(coin)
+        if wait_until is None:
+            return False
+        return datetime.now(timezone.utc) < wait_until
+
     # ------------------------------------------------------------------
     # 병렬 실행 헬퍼
     # ------------------------------------------------------------------
@@ -1064,12 +1151,8 @@ class TradingEngine:
             }
 
         async def _filter_one(ms: MarketState) -> tuple[str, Any]:
-            try:
-                result = self._layer1.filter(ms)
-                return ms.coin, result.__dict__ if hasattr(result, "__dict__") else result
-            except Exception as exc:
-                logger.error("[Engine] Layer1 %s 실패: %s", ms.coin, exc)
-                return ms.coin, {"tradeable": False}
+            result = await self._layer1.check(ms, ms.coin)
+            return ms.coin, result.__dict__ if hasattr(result, "__dict__") else result
 
         results = await asyncio.gather(*[_filter_one(ms) for ms in market_states])
         return dict(results)
@@ -1117,33 +1200,33 @@ class TradingEngine:
         market_states: list[MarketState],
         ensemble_preds: dict[str, EnsemblePrediction],
     ) -> dict[str, RiskBudget]:
-        """Kelly + VaR 리스크 예산 계산 (단순화 버전).
+        """KellySizer 기반 포지션 사이징.
 
-        Phase A: Kelly = 0.02 (자본의 2%) 고정, VaR = ATR 기반 근사.
-        Phase B+: PyPortfolioOpt 연동으로 교체.
+        - win_rate: ep.weighted_avg (앙상블 매수 확률 프록시)
+        - profit_loss_ratio: 1.5 고정 (Phase A; Phase B+에서 실거래 통계로 교체)
+        - MIN_POSITION_KRW 미달 시 final_position_size=0 → 진입 차단
         """
+        self._kelly.update_capital(self._capital)
         budgets: dict[str, RiskBudget] = {}
         for ms in market_states:
             ep = ensemble_preds.get(ms.coin)
             if ep is None:
                 continue
 
-            # 단순 Kelly: signal strength × 2%
-            kelly_f = max(0.0, (ep.weighted_avg - 0.5) * 0.04)
-
-            # ATR 기반 VaR 근사
-            var_95 = (ms.atr_5m / ms.close_5m) * 1.65 if ms.close_5m > 0 else 0.03
-
-            final_size = self._capital * kelly_f
-            budgets[ms.coin] = RiskBudget(
+            atr_price_ratio = ms.atr_5m / ms.close_5m if ms.close_5m > 0 else 0.01
+            budget = self._kelly.compute(
                 coin=ms.coin,
-                timestamp=ms.timestamp,
-                kelly_f=kelly_f,
-                hmm_adjusted_f=kelly_f,
-                var_adjusted_f=kelly_f,
-                final_position_size=max(5_000, final_size),  # 최소 5,000원
-                var_95=var_95,
+                win_rate=ep.weighted_avg,
+                profit_loss_ratio=1.5,  # Phase A 고정; Phase B+에서 실거래 통계로 교체
+                hmm_confidence=ep.hmm_confidence,
+                hmm_regime=ep.hmm_regime,
+                atr_price_ratio=atr_price_ratio,
             )
+            # engine 레벨 VaR 체크용 var_95를 ATR 기반 근사로 덮어쓰기
+            # KellySizer 내부 var_overlay는 historical returns 없어 기본 2% 고정이나
+            # ATR 기반 근사가 Phase A 장중 변동성 반영에 더 적합함
+            budget.var_95 = atr_price_ratio * 1.65
+            budgets[ms.coin] = budget
         return budgets
 
     async def _save_cycle_data(
@@ -1173,7 +1256,10 @@ class TradingEngine:
                 "dry_run": d.is_dry_run,
                 "timestamp": d.timestamp.isoformat(),
             }
-            await self._telegram_queue.put(event)
+            try:
+                self._telegram_queue.put_nowait(event)
+            except asyncio.QueueFull:
+                logger.warning("[Engine] telegram_queue 포화(maxsize=100) — 드롭: %s", event.get("event_type"))
 
     # ------------------------------------------------------------------
     # 상태 조회
@@ -1194,6 +1280,16 @@ class TradingEngine:
     @property
     def is_dry_run(self) -> bool:
         return self._dry_run
+
+    def pause_trading(self) -> None:
+        """신규 진입 일시중단 (VACUUM 등 DB 단독 연결 구간에서 호출)."""
+        self._trading_paused = True
+        logger.warning("[Engine] pause_trading: 신규 진입 중단")
+
+    def resume_trading(self) -> None:
+        """신규 진입 재개."""
+        self._trading_paused = False
+        logger.warning("[Engine] resume_trading: 신규 진입 재개")
 
     def get_status(self) -> dict[str, Any]:
         return {

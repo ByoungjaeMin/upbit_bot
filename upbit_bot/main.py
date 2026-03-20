@@ -392,7 +392,27 @@ class BotApplication:
             misfire_grace_time=3600,
         )
 
-        logger.info("[main] APScheduler 7개 크론 작업 등록 완료 (coin_history는 독립 프로세스)")
+        # 매주 일요일 03:00 UTC — KellySizer ATR 변동성 그룹 임계값 재계산
+        self._scheduler.add_job(
+            self._job_atr_group_weekly,
+            CronTrigger(day_of_week="sun", hour=3, minute=0),
+            id="atr_group_weekly",
+            name="ATR 변동성 그룹 주간 재계산",
+            misfire_grace_time=600,
+        )
+
+        logger.info("[main] APScheduler 8개 크론 작업 등록 완료 (coin_history는 독립 프로세스)")
+
+    async def _job_atr_group_weekly(self) -> None:
+        """매주 일요일 03:00 UTC — KellySizer ATR 변동성 그룹 임계값 재계산."""
+        logger.info("[scheduler] ATR 그룹 주간 재계산 시작")
+        if self._engine is None:
+            logger.warning("[scheduler] engine 미초기화 — ATR 그룹 재계산 스킵")
+            return
+        # Phase B+에서는 최근 1주 MarketState의 atr_5m/close_5m 수집값을 전달.
+        # Phase A: 샘플 없음 → KellySizer가 코드 상수 기본값으로 리셋.
+        self._engine._kelly.refresh_atr_groups(atr_ratios=None)
+        logger.info("[scheduler] ATR 그룹 주간 재계산 완료")
 
     async def _job_coin_history_snapshot(self) -> None:
         """매일 00:00 UTC — 업비트 KRW 마켓 코인 목록 스냅샷 저장."""

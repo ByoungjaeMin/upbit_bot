@@ -124,7 +124,8 @@ class CandleCache:
             df = pd.read_sql_query(sql, self._conn, params=(coin, limit))
         if df.empty:
             return df
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        # format='ISO8601': REST(tz-naive)·WebSocket(+00:00 tz-aware) 혼합 형식 처리
+        df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601", utc=True)
         return df.sort_values("timestamp").reset_index(drop=True)
 
     def get_latest_timestamp(self, table: str, coin: str) -> datetime | None:

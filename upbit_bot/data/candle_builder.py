@@ -433,7 +433,8 @@ class CandleBuilder:
             return None
 
         df = pd.DataFrame(raw)
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        # format='ISO8601': REST(tz-naive)·WebSocket(+00:00 tz-aware) 혼합 형식 처리
+        df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601", utc=True)
         df = df.set_index("timestamp").sort_index()
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")

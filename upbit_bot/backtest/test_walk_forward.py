@@ -302,12 +302,15 @@ class TestGenerateCycles:
         for c in cycles:
             assert len(c) == 4
 
-    def test_oos_start_equals_is_end(self):
+    def test_oos_start_one_day_after_is_end(self):
+        from datetime import datetime, timedelta
         wf = WalkForwardOptimizer()
         df = _make_large_df(months=10)
         cycles = wf._generate_cycles(df)
         for is_s, is_e, oos_s, oos_e in cycles:
-            assert is_e == oos_s
+            is_e_dt  = datetime.strptime(is_e,  "%Y-%m-%d")
+            oos_s_dt = datetime.strptime(oos_s, "%Y-%m-%d")
+            assert oos_s_dt == is_e_dt + timedelta(days=1)
 
 
 # ---------------------------------------------------------------------------

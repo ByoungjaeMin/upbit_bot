@@ -66,7 +66,24 @@
       "Bash(head -10 grep -n \"DataQualityChecker\\\\|quality\\\\|QualityReport\" /Users/byoungjaemin/quant/upbit_bot/main.py)",
       "Bash(../venv/bin/pytest . --ignore=monitoring -q --tb=short)",
       "Bash(head -20 grep -n \"get_market_state_snapshot\\\\|daily_features\\\\|ema50_1d\\\\|rsi_1d\\\\|trend_encoding_1d\" /Users/byoungjaemin/quant/upbit_bot/data/test_candle_builder.py)",
-      "Bash(../venv/bin/pytest data/test_candle_builder.py::TestOneHourSynthesis::test_12_candles_produce_1h -q --tb=long)"
+      "Bash(../venv/bin/pytest data/test_candle_builder.py::TestOneHourSynthesis::test_12_candles_produce_1h -q --tb=long)",
+      "Bash(/Users/byoungjaemin/quant/venv/bin/python -c \"import pyupbit, pandas, numpy; print\\('deps OK'\\)\")",
+      "Bash(/Users/byoungjaemin/quant/venv/bin/python -c \"\nimport sys\nsys.path.insert\\(0, 'upbit_bot'\\)\nfrom risk.circuit_breaker import CircuitBreaker\nprint\\('CircuitBreaker import OK'\\)\nprint\\(dir\\(CircuitBreaker\\)\\)\n\")",
+      "Bash(kill -SIGINT 60184)",
+      "Bash(wait 60184)",
+      "Bash(echo \"exit_code=$?\")",
+      "Bash(kill -SIGINT 60963)",
+      "Bash(/Users/byoungjaemin/quant/venv/bin/python -m pytest upbit_bot/ -x -q --tb=short)",
+      "Bash(python3 -c \"import psutil; p = psutil.Process\\(\\); print\\(f''현재 메모리 측정 준비''\\)\")",
+      "Bash(/Users/byoungjaemin/quant/venv/bin/python -c \"import psutil; print\\(''psutil OK''\\)\")",
+      "Bash(ps -o pid,rss,vsz -p 65338)",
+      "Bash(kill -SIGINT 65338)",
+      "Bash(kill -SIGINT 78253)",
+      "Bash(sleep 3 grep -E \"TaskGroup|ERROR\" /tmp/shakedown2_s1.log)",
+      "Bash(kill -SIGINT 78995)",
+      "Bash(/Users/byoungjaemin/quant/venv/bin/python -c \"\nimport sys\nsys.path.insert\\(0, 'upbit_bot'\\)\nfrom risk.circuit_breaker import CircuitBreaker\n\ncb = CircuitBreaker\\(\\)\nprint\\('=== 초기 상태 ==='\\)\nprint\\(f'level={cb.level}, is_buy_blocked={cb.is_buy_blocked\\(\\)}'\\)\n\nprint\\(\\)\nprint\\('=== trigger\\(3, 셰이크다운 테스트\\) ==='\\)\ncb.trigger\\(3, '셰이크다운 테스트'\\)\ns = cb.get_status\\(\\)\nprint\\(f'level={s[\\\\\"level\\\\\"]}, reason={s[\\\\\"reason\\\\\"]}'\\)\nprint\\(f'is_buy_blocked={cb.is_buy_blocked\\(\\)} ← 매수 차단'\\)\nprint\\(f'is_all_blocked={cb.is_all_blocked\\(\\)} ← 전면 차단'\\)\n\nprint\\(\\)\nprint\\('=== reset\\(\\) 복귀 ==='\\)\ncb.reset\\(\\)\nprint\\(f'level={cb.level}, is_buy_blocked={cb.is_buy_blocked\\(\\)}'\\)\nprint\\('복귀 정상:', cb.level == 0 and not cb.is_buy_blocked\\(\\)\\)\n\")",
+      "Bash(ps -o pid,rss -p 79396)",
+      "Bash(ps -o pid,rss,etime -p 79396)"
     ]
   }
 }

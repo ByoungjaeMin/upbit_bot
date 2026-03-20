@@ -249,7 +249,7 @@ class TelegramBot:
             )
         self._token   = resolved_token
         self._chat_id = resolved_chat_id
-        self._queue: asyncio.Queue[dict[str, Any]] = event_queue or asyncio.Queue()
+        self._queue: asyncio.Queue[dict[str, Any]] = event_queue or asyncio.Queue(maxsize=100)
         self._ctx = BotContext()
         self._app: Any = None
         self._formatter = MessageFormatter()
@@ -322,11 +322,14 @@ class TelegramBot:
         parse_mode: str = "HTML",
     ) -> None:
         """메시지를 큐에 추가. 우선순위 1=즉시 / 2=일반 / 3=배치."""
-        await self._queue.put({
-            "text": message,
-            "priority": priority,
-            "parse_mode": parse_mode,
-        })
+        try:
+            self._queue.put_nowait({
+                "text": message,
+                "priority": priority,
+                "parse_mode": parse_mode,
+            })
+        except asyncio.QueueFull:
+            logger.warning("[TelegramBot] 메시지 큐 포화(maxsize=100) — 드롭: %.80s", message)
 
     async def send_buy(self, **kwargs) -> None:
         msg = self._formatter.buy(**kwargs)
@@ -455,7 +458,11 @@ class TelegramBot:
     async def _guard(self, update: Any, context: Any) -> bool:
         """화이트리스트 가드 — 미등록 사용자 차단."""
         if not self._check_whitelist(update):
-            await update.message.reply_text("⛔ 권한 없음")
+            chat_id = (
+                update.effective_chat.id
+                if update and update.effective_chat else "unknown"
+            )
+            logger.warning("[TelegramBot] 미등록 접근 차단 (command): chat_id=%s", chat_id)
             return False
         return True
 
@@ -586,6 +593,9 @@ class TelegramBot:
     async def _cmd_emergency(self, update: Any, context: Any) -> None:
         if not await self._guard(update, context):
             return
+        if self._ctx.emergency_pending:
+            await update.message.reply_text("⚠️ 이미 긴급 대기 중 — /confirm 또는 30초 대기")
+            return
         self._ctx.emergency_pending = True
         await update.message.reply_text(
             "🚨 <b>긴급 전량매도</b> 준비\n"
@@ -607,8 +617,20 @@ class TelegramBot:
             return
         self._ctx.emergency_pending = False
         self._ctx.stop_new_buys = True
-        await update.message.reply_text("🚨 전량매도 실행 — 엔진 연동 필요")
+        engine = self._ctx.engine
+        if engine is None:
+            raise RuntimeError("[TelegramBot] /confirm: engine 미연결 — 긴급 청산 불가")
         logger.warning("[TelegramBot] /confirm 수신 — 긴급 전량매도 트리거")
+        results = await engine.emergency_liquidate_all()
+        failed = [c for c, ok in results.items() if not ok]
+        if failed:
+            await self._send_with_retry(
+                f"⚠️ 긴급 청산 부분 실패: {failed}\n포지션 루프에서 재시도 예정"
+            )
+        else:
+            await self._send_with_retry(
+                f"✅ 긴급 청산 완료: {len(results)}개 포지션 청산됨"
+            )
 
     async def _cmd_report(self, update: Any, context: Any) -> None:
         if not await self._guard(update, context):
@@ -873,6 +895,8 @@ class TelegramBot:
             await update.message.reply_text("⚠️ StorageManager 미연결")
             return
         await update.message.reply_text("🗜️ VACUUM 실행 중... (수십 초 소요)")
+        if engine is not None:
+            storage.set_engine(engine)
         try:
             await asyncio.to_thread(storage.vacuum_database)
             await self._send_with_retry("✅ VACUUM 완료")
@@ -1028,6 +1052,11 @@ class TelegramBot:
         await query.answer()
 
         if not self._check_whitelist(update):
+            chat_id = (
+                update.effective_chat.id
+                if update and update.effective_chat else "unknown"
+            )
+            logger.warning("[TelegramBot] 미등록 접근 차단 (callback): chat_id=%s", chat_id)
             return
 
         dispatch = {

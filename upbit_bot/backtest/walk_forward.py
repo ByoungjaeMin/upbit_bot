@@ -99,6 +99,7 @@ class PeriodMetrics:
     total_return: float
     profit_loss_ratio: float    # 평균 수익 / 평균 손실
     strategy_contributions: dict[str, float] = field(default_factory=dict)
+    pnl_list: list[float] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -178,8 +179,12 @@ class SurvivourshipHandler:
         """
         self._snapshots: dict[str, list[str]] = snapshot_map or {}
 
-    def load_from_db(self, db_path: str) -> None:
-        """SQLite coin_history 테이블에서 스냅샷 로드."""
+    def load_from_db(self, db_path: str) -> bool:
+        """SQLite coin_history 테이블에서 스냅샷 로드.
+
+        Returns:
+            True: 스냅샷 1개 이상 로드 성공, False: 로드 실패 또는 데이터 없음
+        """
         try:
             import sqlite3
             conn = sqlite3.connect(db_path)
@@ -194,8 +199,10 @@ class SurvivourshipHandler:
                 snap[date_str].append(coin)
             self._snapshots = dict(snap)
             logger.info("[Survivourship] %d일치 스냅샷 로드", len(self._snapshots))
+            return bool(self._snapshots)
         except Exception as exc:
             logger.error("[Survivourship] DB 로드 실패: %s", exc)
+            raise
 
     def get_coins_at(self, target_date: str | date) -> list[str]:
         """특정 날짜의 유효 코인 목록 반환.
@@ -413,6 +420,7 @@ class BacktestEngine:
             total_return=total_return,
             profit_loss_ratio=pl_ratio,
             strategy_contributions=strat_avg,
+            pnl_list=list(pnls),
         )
 
     @staticmethod
@@ -531,7 +539,7 @@ class WalkForwardOptimizer:
                 result.overfitting_cycles += 1
 
             # OOS 손익 누적
-            all_oos_pnls.extend([0.0] * oos_metrics.n_trades)  # 실제 trade pnl 집계 시 교체
+            all_oos_pnls.extend(oos_metrics.pnl_list)
 
         result.all_oos_pnls = all_oos_pnls
         if result.cycles:
@@ -560,10 +568,11 @@ class WalkForwardOptimizer:
             if oos_end_approx > end:
                 break
 
+            oos_start = is_end_approx + pd.Timedelta(days=1)
             cycles.append((
                 cursor.strftime("%Y-%m-%d"),
                 is_end_approx.strftime("%Y-%m-%d"),
-                is_end_approx.strftime("%Y-%m-%d"),
+                oos_start.strftime("%Y-%m-%d"),
                 oos_end_approx.strftime("%Y-%m-%d"),
             ))
             cursor = is_end_approx  # 전진

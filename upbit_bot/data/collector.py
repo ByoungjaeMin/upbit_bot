@@ -952,10 +952,18 @@ class UpbitDataCollector:
         logger.info("초기 히스토리 로딩 시작: %d코인", len(pairs))
 
         for coin in pairs:
-            # 이미 데이터 있으면 스킵
+            # 이미 데이터 있으면 REST 스킵 — 단, 인메모리 캔들은 DB에서 복원
             latest = self._cache.get_latest_timestamp("candles_5m", coin)
             if latest is not None:
-                logger.debug("[%s] 기존 데이터 존재 — 초기 로딩 스킵", coin)
+                df_cached = self._cache.get_recent_candles("candles_5m", coin, limit=200)
+                if not df_cached.empty:
+                    cached_rows = df_cached.to_dict("records")
+                    for row in cached_rows:
+                        ts = row.get("timestamp")
+                        if hasattr(ts, "isoformat"):
+                            row["timestamp"] = ts.isoformat()
+                        self._candle_builder.add_historical_candle(coin, row)
+                    logger.info("[%s] DB→인메모리 캔들 복원: %d개", coin, len(cached_rows))
                 continue
 
             await self._rate_limiter.acquire()
@@ -1044,7 +1052,7 @@ class UpbitDataCollector:
         """asyncio.Queue에서 RawMarketData 꺼내 CandleBuilder 전달.
 
         stop() 호출 시 태스크가 cancel되어 CancelledError로 종료.
-        on_trade() 예외는 로깅 후 루프 유지 (서킷브레이커 오류 기록).
+        on_trade() 예외는 로깅 후 루프 유지.
         """
         while True:
             try:
@@ -1056,10 +1064,9 @@ class UpbitDataCollector:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.error("[Collector] CandleBuilder.on_trade() 실패: %s", exc)
-                if self._cb is not None:
-                    self._cb.record_api_error()
-                # 예외 발생 시 루프 유지 — 다음 메시지 처리 계속
+                # 의도적 계속 진행: 단일 trade 메시지 파싱 실패는
+                # 스트림 중단 사유 아님. record_api_error 호출 금지.
+                logger.warning("[Collector] CandleBuilder.on_trade() 스킵: %s", exc)
 
     # ------------------------------------------------------------------
     # MarketState 조회

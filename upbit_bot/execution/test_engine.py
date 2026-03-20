@@ -21,6 +21,7 @@ from execution.engine import (
     TradingEngine,
 )
 from execution.order import UpbitClient
+from risk.kelly import MIN_POSITION_KRW
 from schema import EnsemblePrediction, MarketState, RiskBudget
 
 
@@ -212,8 +213,13 @@ class TestReentryConditions:
 
     def test_exactly_2_conditions_met_passes(self):
         engine = _engine()
-        # tick OK, RSI OK, OBI not OK
-        ms = _ms(tick_imbalance=0.20, rsi=50.0, obi=0.05)
+        # tick OK, SuperTrend 역전 OK, OBI not OK → 2/3 충족
+        engine._state.stop_loss_history["BTC"] = {
+            "ts": datetime.now(timezone.utc),
+            "supertrend_dir": -1,  # 손절 당시 하락
+        }
+        ms = _ms(tick_imbalance=0.20, obi=0.05)
+        ms.supertrend_dir = 1  # 현재 상승 → 역전됨
         assert engine._check_reentry_conditions(ms) is True
 
 
@@ -325,27 +331,36 @@ class TestPositionMonitor:
     def test_trailing_stop_updates(self):
         engine = _engine()
         pos = Position("BTC", 50_000_000, 0.002, 100_000, "TREND_STRONG")
+        # TrailingStopManager init 필요 (포지션 등록 없으면 update 무시됨)
+        engine._trailing.init("BTC", 50_000_000, 500_000, "TREND_STRONG")
+        pos.trailing_stop_price = engine._trailing.get_stop("BTC")
         ms = _ms(atr=500_000)
         engine._update_trailing_stop(pos, ms)
-        # trailing_stop = close - atr*2
-        expected = ms.close_5m - ms.atr_5m * 2.0
+        # TREND_STRONG 멀티플라이어 3.0 적용: 50_000_000 - 500_000 * 3.0
+        expected = 50_000_000 - 500_000 * 3.0
         assert pos.trailing_stop_price == pytest.approx(expected)
 
     def test_trailing_stop_only_increases(self):
         engine = _engine()
         pos = Position("BTC", 50_000_000, 0.002, 100_000, "TREND_STRONG")
-        pos.trailing_stop_price = 49_000_000  # 기존 값
-        ms = _ms(price=50_000_000, atr=100_000)  # 새 stop = 49_800_000
+        init_stop = engine._trailing.init("BTC", 50_000_000, 500_000, "TREND_STRONG")
+        pos.trailing_stop_price = init_stop  # 48_500_000
+        initial_stop = pos.trailing_stop_price
+        # 가격 상승 → peak 갱신 → stop 상향 조정
+        ms = _ms(price=52_000_000, atr=500_000)  # new_stop = 52M - 500K*3.0 = 50_500_000
         engine._update_trailing_stop(pos, ms)
-        assert pos.trailing_stop_price >= 49_000_000
+        assert pos.trailing_stop_price > initial_stop
 
     def test_trailing_stop_no_update_if_lower(self):
         engine = _engine()
         pos = Position("BTC", 50_000_000, 0.002, 100_000, "TREND_STRONG")
-        pos.trailing_stop_price = 49_000_000
-        ms = _ms(price=48_000_000, atr=1_000_000)  # 새 stop = 46_000_000 (낮음)
+        # init: stop = 50M - 100K*3.0 = 49_700_000
+        init_stop = engine._trailing.init("BTC", 50_000_000, 100_000, "TREND_STRONG")
+        pos.trailing_stop_price = init_stop
+        # 가격 하락 + ATR 증가 → ATR 기반 신규 stop = 50M-1M*3.0=47M < 현재 49.7M → 유지
+        ms = _ms(price=49_800_000, atr=1_000_000)
         engine._update_trailing_stop(pos, ms)
-        assert pos.trailing_stop_price == pytest.approx(49_000_000)
+        assert pos.trailing_stop_price == pytest.approx(49_700_000)
 
     def test_pnl_pct_calculation(self):
         pos = Position("BTC", 50_000_000, 0.002, 100_000, "TREND_STRONG")
@@ -419,7 +434,7 @@ class TestPositionLoop:
         closed = []
         original_close = engine._close_position
 
-        async def mock_close(coin, price, reason="", emergency=False, partial_ratio=None):
+        async def mock_close(coin, price, reason="", emergency=False, partial_ratio=None, supertrend_dir: int = 0):
             closed.append((coin, reason))
             engine._positions.pop(coin, None)
             return True
@@ -469,18 +484,21 @@ class TestRiskBudgets:
         assert budgets["BTC"].kelly_f > 0
 
     def test_kelly_zero_for_neutral(self):
+        # KellySizer: kelly_f=0 조건 → win_rate = 1/(profit_loss_ratio+1) = 1/2.5 = 0.40
         engine = _engine()
         ms = _ms()
-        ep = _ep(weighted_avg=0.50)
+        ep = _ep(weighted_avg=0.40)
         budgets = engine._compute_risk_budgets([ms], {"BTC": ep})
         assert budgets["BTC"].kelly_f == pytest.approx(0.0)
 
-    def test_min_position_size_5000(self):
+    def test_min_position_size_enforced(self):
+        # KellySizer: final_size >= MIN_POSITION_KRW(50,000) 또는 0 (미달 시 진입 불가)
         engine = _engine()
         ms = _ms()
-        ep = _ep(weighted_avg=0.501)  # 매우 낮은 Kelly
+        ep = _ep(weighted_avg=0.70)  # 충분히 높은 Kelly
         budgets = engine._compute_risk_budgets([ms], {"BTC": ep})
-        assert budgets["BTC"].final_position_size >= 5_000
+        size = budgets["BTC"].final_position_size
+        assert size == 0.0 or size >= MIN_POSITION_KRW
 
 
 # ---------------------------------------------------------------------------

@@ -163,8 +163,8 @@ class StrategySelector:
         try:
             weights = self._decay_monitor.get_weights()
         except Exception as exc:
-            logger.warning("[StrategySelector] decay_monitor 오류 — 기본 배분 사용: %s", exc)
-            return base_alloc * mult
+            logger.error("[StrategySelector] decay_monitor.get_weights() 실패: %s", exc)
+            raise
 
         if not weights or all(v == 0.0 for v in weights.values()):
             # 모든 전략 DORMANT → HOLD 100%

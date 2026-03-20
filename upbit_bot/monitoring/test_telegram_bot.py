@@ -292,7 +292,8 @@ class TestTelegramBotCommands:
         async def _run() -> None:
             result = await bot._guard(update, MagicMock())
             assert result is False
-            update.message.reply_text.assert_awaited_once()
+            # silent drop — 미등록 사용자에게 응답하지 않음
+            update.message.reply_text.assert_not_awaited()
 
         run(_run())
 
@@ -379,10 +380,29 @@ class TestTelegramBotCommands:
         bot._ctx.emergency_pending = True
         update = self._make_update()
 
+        mock_engine = MagicMock()
+        mock_engine.emergency_liquidate_all = AsyncMock(return_value={"KRW-BTC": True})
+        bot._ctx.engine = mock_engine
+        bot._app = MagicMock()
+        bot._app.bot.send_message = AsyncMock()
+
         async def _run() -> None:
             await bot._cmd_confirm(update, MagicMock())
             assert bot._ctx.emergency_pending is False
             assert bot._ctx.stop_new_buys is True
+            mock_engine.emergency_liquidate_all.assert_awaited_once()
+
+        run(_run())
+
+    def test_cmd_confirm_raises_when_no_engine(self) -> None:
+        bot = self._make_bot()
+        bot._ctx.emergency_pending = True
+        bot._ctx.engine = None
+        update = self._make_update()
+
+        async def _run() -> None:
+            with pytest.raises(RuntimeError, match="engine 미연결"):
+                await bot._cmd_confirm(update, MagicMock())
 
         run(_run())
 

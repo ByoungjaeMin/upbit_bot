@@ -306,4 +306,5 @@ class StrategyDecayMonitor:
             }
             self._cache.insert_row("strategy_decay_log", row)
         except Exception as exc:
-            logger.error("[DecayMonitor] DB 저장 실패: %s", exc)
+            # 의도적 계속 진행: 전략 로그 저장 실패는 트레이딩 중단 사유 아님
+            logger.warning("[DecayMonitor] DB 저장 실패: %s", exc)

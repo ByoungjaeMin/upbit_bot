@@ -9,7 +9,7 @@ docs/upbit_quant_v9.md 참조.
 - 프로젝트 특화 구현 + 실전 고려사항 집중
 
 ## 현재 진행 단계
-Phase A 완료. Phase B 준비 중.
+Phase A 완료. Phase B 코드 완성 + 전체 코드리뷰 완료. 맥미니 도착 후 데이터 수집 시작.
 Phase A → B → C → D 순서 엄수.
 
 ---
@@ -69,11 +69,13 @@ predictions(id, coin, timestamp, ensemble_prob, signal,
 circuit_breaker_log(id, level, reason, triggered_at, resolved_at, action_taken)
 
 -- 생존편향 처리용 스냅샷 (매일 00:05 수집)
-coin_history(date, tickers_json, coin_count)
+coin_history(id, snapshot_date, coin, volume_24h_krw, rank,
+    market_cap_krw, included_in_pairlist)
 
 -- 전략 성과 추적 (StrategyDecayMonitor용)
-strategy_log(id, strategy, trade_id, sharpe_rolling_4w, win_rate, profit_factor, timestamp)
-strategy_decay_log(id, strategy, status, triggered_at, reason)
+strategy_log(id, strategy_type, pnl_pct, pnl, timestamp)
+strategy_decay_log(id, week_start, strategy_type, rolling_sharpe, win_rate,
+                   profit_loss_ratio, trade_count, is_dormant, dormant_since, revival_date)
 
 -- 백테스트 결과
 backtest_results(id, run_id, strategy, sharpe, max_drawdown,
@@ -82,9 +84,6 @@ backtest_results(id, run_id, strategy, sharpe, max_drawdown,
 
 -- 페이퍼 트레이딩 비교
 paper_trades(id, coin, strategy, signal_match_rate, price_deviation, timing_slippage, timestamp)
-
--- 데이터 품질 점수
-data_quality_log(id, coin, timeframe, score, issues_json, timestamp)
 
 -- 디스크·스토리지 모니터링
 storage_log(id, db_size_mb, disk_free_gb, checked_at)
@@ -100,7 +99,9 @@ storage_log(id, db_size_mb, disk_free_gb, checked_at)
 
 ```python
 # risk/circuit_breaker.py
-CircuitBreaker.check() -> bool
+CircuitBreaker.is_buy_blocked() -> bool
+CircuitBreaker.is_sell_blocked() -> bool
+CircuitBreaker.is_all_blocked() -> boolCircuitBreaker.check() -> bool
 # False = 매수 전면 차단. 모든 진입 판단 전 최우선 호출 필수.
 CircuitBreaker.record_api_error() -> None
 CircuitBreaker.get_level() -> int  # 0=정상, 1~5=차단 수준
@@ -111,22 +112,26 @@ SmartOrderRouter.execute(coin: str, side: str, amount: float) -> OrderResult
 PartialFillHandler.handle(order_id: str) -> FillResult
 # 부분체결 감지 → 잔여 수량 추적 → 이중 주문 방지.
 
+# layers/layer1_filter.py
+Layer1MarketFilter.check(ms: MarketState, coin: str) -> FilterResult
+# FilterResult.tradeable=False 시 해당 코인 진입 스킵.
+
 # layers/layer2_ensemble.py
-Layer2Ensemble.predict(features: pd.DataFrame) -> float
-# 반환: 0.0~1.0 매수 확률. 임계값 0.62 이상 시 진입 신호.
+Layer2Ensemble.predict(ms: MarketState) -> EnsemblePrediction
+# EnsemblePrediction.prob: 0.0~1.0 매수 확률. 임계값 0.62 이상 시 진입 신호.
 # Phase B 이전: _PHASE_B_ACTIVE=False → XGBoost+LightGBM만 사용.
 
 # risk/kelly.py
-KellyCalculator.calc_f(win_rate: float, odds: float) -> float
-# 반환: 0.0~0.5 포지션 비율. 음수 또는 0 반환 시 포지션 진입 금지.
+KellySizer.compute(coin: str, win_rate: float, profit_loss_ratio: float, ...) -> RiskBudget
+# RiskBudget.fraction: 0.0~0.5 포지션 비율. 0 이하 반환 시 포지션 진입 금지.
 
 # risk/trailing_stop.py
-TrailingStop.update(coin: str, current_price: float) -> StopResult
-# StopResult.triggered=True 시 즉시 시장가 청산.
+TrailingStopManager.update(coin: str, current_price: float, atr: float) -> bool
+# True 반환 시 즉시 시장가 청산.
 
 # data/collector.py
-UpbitDataCollector.get_features(coin: str) -> pd.DataFrame
-# 반환 DataFrame: 35개 피처 포함, 일봉 피처 shift(1) 적용 완료.
+async UpbitDataCollector.get_market_state(coin: str) -> MarketState | None
+# 반환 MarketState: 35개 피처 포함, 일봉 피처 shift(1) 적용 완료.
 # 호출 전 circuit_breaker.check() 통과 확인 필수.
 ```
 
@@ -310,11 +315,14 @@ upbit_bot/
 - None 체크 누락 없음
 
 ### Phase B 완료 기준 (맥미니 도착 후)
-- Walk-Forward 샤프비율 > 1.5
-- 최대낙폭 < 20%
-- 승률 > 55%
-- Monte Carlo p-value < 0.05
-- Lookahead Bias 오염 피처 0개
+- ✅ Walk-Forward 코드 완성 (backtest/walk_forward.py)
+- ✅ Monte Carlo 코드 완성 (backtest/monte_carlo.py)
+- ✅ Lookahead Bias 검사 코드 완성 (backtest/lookahead.py)
+- [ ] Walk-Forward 샤프비율 > 1.5 (데이터 수집 후 검증)
+- [ ] 최대낙폭 < 20%
+- [ ] 승률 > 55%
+- [ ] Monte Carlo p-value < 0.05
+- [ ] Lookahead Bias 오염 피처 0개
 
 ### 실전 전환 7가지 체크리스트 (모두 통과 전 실거래 금지)
 - [ ] 샤프비율 > 1.5

@@ -78,6 +78,33 @@ class KellySizer:
         """자본 동적 업데이트 (매 사이클 호출)."""
         self._capital = new_capital
 
+    def refresh_atr_groups(self, atr_ratios: list[float] | None = None) -> None:
+        """ATR 변동성 그룹 임계값 주간 재계산 (매주 일요일 03:00 UTC 호출).
+
+        atr_ratios: 최근 1주 코인별 ATR/가격 비율 목록.
+          - 제공 시: 25번째 백분위 → LOW 임계값, 75번째 → HIGH 임계값으로 갱신.
+          - None(Phase A): 코드 상수(ATR_HIGH_THRESHOLD / ATR_LOW_THRESHOLD)로 리셋.
+        """
+        if not atr_ratios:
+            self._atr_high = ATR_HIGH_THRESHOLD
+            self._atr_low  = ATR_LOW_THRESHOLD
+            logger.info(
+                "[KellySizer] ATR 그룹 임계값 기본값 리셋 high=%.3f low=%.4f",
+                self._atr_high, self._atr_low,
+            )
+            return
+
+        sorted_ratios = sorted(atr_ratios)
+        n = len(sorted_ratios)
+        low_idx  = max(0, int(n * 0.25) - 1)
+        high_idx = min(n - 1, int(n * 0.75))
+        self._atr_low  = sorted_ratios[low_idx]
+        self._atr_high = sorted_ratios[high_idx]
+        logger.info(
+            "[KellySizer] ATR 그룹 임계값 갱신 high=%.3f low=%.4f (샘플 %d개)",
+            self._atr_high, self._atr_low, n,
+        )
+
     def compute(
         self,
         coin: str,

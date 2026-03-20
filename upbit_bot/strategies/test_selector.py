@@ -137,12 +137,13 @@ class TestDynamicWeights:
         d = sel.select_strategy(adx=35.0, fear_greed=50.0, hmm_regime=0)
         assert d.capital_allocation == pytest.approx(BASE_ALLOCATION["HOLD"])
 
-    def test_decay_monitor_error_falls_back_to_base(self):
+    def test_decay_monitor_error_raises(self):
+        # decay_monitor 오류는 fallback 없이 즉시 전파 (자본 배분 오류 인지 불가 방지)
         mock_dm = MagicMock()
         mock_dm.get_weights.side_effect = RuntimeError("DB 오류")
         sel = StrategySelector(decay_monitor=mock_dm, phase_c_enabled=True)
-        d = sel.select_strategy(adx=35.0, fear_greed=50.0, hmm_regime=0)
-        assert d.capital_allocation > 0.0
+        with pytest.raises(RuntimeError):
+            sel.select_strategy(adx=35.0, fear_greed=50.0, hmm_regime=0)
 
 
 class TestStrategyDecisionFields:

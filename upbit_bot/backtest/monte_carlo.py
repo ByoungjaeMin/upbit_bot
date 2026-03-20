@@ -78,6 +78,8 @@ class MonteCarloValidator:
         self._n_shuffles = n_shuffles
         self._p_threshold = p_value_threshold
         self._rf = risk_free_rate
+        # 의도적 고정 seed: 검증 재현성 확보 목적.
+        # 통계적 유의성은 n=1000 셔플 수로 확보.
         self._rng = np.random.default_rng(42)
 
     def validate(
